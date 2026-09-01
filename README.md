@@ -33,7 +33,7 @@ app.py                                    <- final integration entrypoint, built
 
 | Person | Module | Depends on (at final integration only) |
 |---|---|---|
-| P1 (you) | Onboarding engine (SLM) + integration lead | P3's raw events |
+| P1 | Onboarding engine (SLM) + integration lead | P3's raw events |
 | P2 | Format fingerprinting + deterministic parser engine | P1's rules |
 | P3 | Ingestion + raw storage + traceability + rule validation | nothing upstream |
 | P4 | Review-gate UI + normalized event browser (Streamlit) | P1's rules, P3's validation |
