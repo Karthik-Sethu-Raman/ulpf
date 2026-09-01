@@ -1,0 +1,3 @@
+CEF:0|PaloAlto|PAN-OS|10.1|THREAT|spyware|5|src=203.0.113.45 dst=192.168.1.10 spt=51422 dpt=443 act=block cat=spyware msg=Suspicious DNS Query
+CEF:0|PaloAlto|PAN-OS|10.1|THREAT|malware|7|src=198.51.100.22 dst=192.168.1.14 spt=44521 dpt=80 act=alert cat=malware msg=Known bad hash
+CEF:0|CiscoASA|ASA|9.1|106023|Deny|4|src=203.0.113.90 dst=192.168.1.20 spt=51500 dpt=22 act=deny

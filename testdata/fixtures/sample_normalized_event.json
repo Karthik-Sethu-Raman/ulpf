@@ -1,0 +1,13 @@
+{
+  "event_id": "evt_00042",
+  "raw_id": "raw_00042",
+  "fingerprint_id": "cef_paloalto_v1",
+  "rule_version": 1,
+  "class_name": "Network Activity",
+  "time": "2026-08-27T14:32:07+05:30",
+  "severity_id": 5,
+  "src_endpoint": {"ip": "203.0.113.45", "port": 51422},
+  "dst_endpoint": {"ip": "192.168.1.10", "port": 443},
+  "action": "block",
+  "unmapped_fields": {"cat": "spyware", "msg": "Suspicious DNS Query"}
+}

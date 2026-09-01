@@ -1,0 +1,10 @@
+{
+  "rule_fingerprint_id": "cef_paloalto_v1",
+  "passed": true,
+  "checks": {
+    "ip_fields_look_like_ips": true,
+    "port_fields_in_range": true,
+    "required_fields_populated": true
+  },
+  "notes": "Validated against 5 held-out CEF sample lines."
+}

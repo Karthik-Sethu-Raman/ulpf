@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# SQLite databases (each person's local ingestion DB — don't commit real data)
+*.db
+*.sqlite
+*.sqlite3
+
+# Streamlit
+.streamlit/
+
+# Env / secrets
+.env
+*.env.local
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Ollama model cache (if anyone runs it inside the repo dir — usually lives outside, but just in case)
+.ollama/

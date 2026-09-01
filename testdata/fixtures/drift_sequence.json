@@ -1,0 +1,9 @@
+[
+  {"fingerprint_id": "cef_paloalto_v1", "field_name": "src_endpoint.ip", "window_start": "t0", "window_end": "t1", "null_rate": 0.01, "baseline_null_rate": 0.01, "severity": "none"},
+  {"fingerprint_id": "cef_paloalto_v1", "field_name": "src_endpoint.ip", "window_start": "t1", "window_end": "t2", "null_rate": 0.02, "baseline_null_rate": 0.01, "severity": "none"},
+  {"fingerprint_id": "cef_paloalto_v1", "field_name": "src_endpoint.ip", "window_start": "t2", "window_end": "t3", "null_rate": 0.06, "baseline_null_rate": 0.01, "severity": "minor"},
+  {"fingerprint_id": "cef_paloalto_v1", "field_name": "src_endpoint.ip", "window_start": "t3", "window_end": "t4", "null_rate": 0.09, "baseline_null_rate": 0.01, "severity": "minor"},
+  {"fingerprint_id": "cef_paloalto_v1", "field_name": "src_endpoint.ip", "window_start": "t4", "window_end": "t5", "null_rate": 0.21, "baseline_null_rate": 0.01, "severity": "moderate"},
+  {"fingerprint_id": "cef_paloalto_v1", "field_name": "src_endpoint.ip", "window_start": "t5", "window_end": "t6", "null_rate": 0.34, "baseline_null_rate": 0.01, "severity": "moderate"},
+  {"fingerprint_id": "cef_paloalto_v1", "field_name": "src_endpoint.ip", "window_start": "t6", "window_end": "t7", "null_rate": 0.58, "baseline_null_rate": 0.01, "severity": "severe"}
+]
