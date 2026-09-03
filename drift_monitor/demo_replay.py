@@ -1,5 +1,5 @@
 import json
-from monitor import classify_severity, response_for_severity
+from drift_monitor.monitor import classify_severity, response_for_severity
 
 sequence = json.load(open("testdata/fixtures/drift_sequence.json"))
 
