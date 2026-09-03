@@ -24,9 +24,9 @@ def classify_severity(current_null_rate, baseline_null_rate):
 
     if ratio < 3 or difference < 0.05:
         return "none"
-    elif ratio < 6:
+    elif ratio <= 6:
         return "minor"
-    elif ratio < 15:
+    elif ratio <= 15:
         return "moderate"
     else:
         return "severe"
