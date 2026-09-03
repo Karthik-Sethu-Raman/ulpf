@@ -1,0 +1,15 @@
+{
+  "fingerprint_id": "cef_paloalto_bad",
+  "pattern": "src=(?P<src>\\S+)\\s+dst=(?P<dst>\\S+)\\s+spt=(?P<spt>\\d+)\\s+dpt=(?P<dpt>\\d+)\\s+act=(?P<act>\\S+)",
+  "field_mappings": [
+    {"source_field": "src", "ocsf_path": "src_endpoint.ip"},
+    {"source_field": "dst", "ocsf_path": "dst_endpoint.ip"},
+    {"source_field": "spt", "ocsf_path": "src_endpoint.port"},
+    {"source_field": "act", "ocsf_path": "dst_endpoint.port"},
+    {"source_field": "cat", "ocsf_path": "unmapped.category"}
+  ],
+  "confidence": 0.4,
+  "provenance": "slm-generated",
+  "version": 1,
+  "created_at": "2026-09-03T00:00:00+00:00"
+}
