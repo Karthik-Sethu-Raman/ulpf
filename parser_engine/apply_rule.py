@@ -11,6 +11,7 @@ import re
 import sys
 import os
 import uuid
+import json
 from typing import Any
 
 # Ensure schemas module can be imported
@@ -33,6 +34,76 @@ def _parse_extension_kv(extension_str: str) -> dict[str, str]:
     return pairs
 
 
+def _resolve_json_path(obj: dict, dotted_path: str):
+    """Walk a nested dict using a dotted path like 'alert.severity'."""
+    current = obj
+    for part in dotted_path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _apply_json_rule(raw_event: RawEvent, rule: Rule) -> NormalizedEvent:
+    """Handles rule.pattern == '__JSON__' -- parses raw_text as JSON and
+    walks dotted-path field_mappings instead of using regex."""
+    obj = json.loads(raw_event.raw_text)
+
+    src_endpoint: dict[str, Any] = {}
+    dst_endpoint: dict[str, Any] = {}
+    action = None
+    severity_id = None
+    event_time = None
+    mapped_paths = set()
+
+    for fm in rule.field_mappings:
+        value = _resolve_json_path(obj, fm.source_field)
+        if value is None:
+            continue
+        mapped_paths.add(fm.source_field)
+        if fm.ocsf_path == "src_endpoint.ip":
+            src_endpoint["ip"] = str(value)
+        elif fm.ocsf_path == "src_endpoint.port":
+            src_endpoint["port"] = value
+        elif fm.ocsf_path == "dst_endpoint.ip":
+            dst_endpoint["ip"] = str(value)
+        elif fm.ocsf_path == "dst_endpoint.port":
+            dst_endpoint["port"] = value
+        elif fm.ocsf_path == "action":
+            action = str(value)
+        elif fm.ocsf_path == "severity_id":
+            severity_id = int(value) if value is not None else None
+        elif fm.ocsf_path == "time":
+            event_time = str(value)
+
+    def _flatten(o, prefix=""):
+        flat = {}
+        for k, v in o.items():
+            path = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                flat.update(_flatten(v, path))
+            else:
+                flat[path] = v
+        return flat
+
+    unmapped_fields = {k: v for k, v in _flatten(obj).items() if k not in mapped_paths}
+    raw_suffix = raw_event.raw_id.split("_")[-1] if "_" in raw_event.raw_id else raw_event.raw_id
+
+    return NormalizedEvent(
+        event_id=f"evt_{raw_suffix}",
+        raw_id=raw_event.raw_id,
+        fingerprint_id=rule.fingerprint_id,
+        rule_version=rule.version,
+        class_name="Network Activity",
+        time=event_time or raw_event.timestamp_ingested,
+        severity_id=severity_id,
+        src_endpoint=src_endpoint or None,
+        dst_endpoint=dst_endpoint or None,
+        action=action,
+        unmapped_fields=unmapped_fields,
+    )
+
+
 def apply_rule(raw_event: RawEvent, rule: Rule) -> NormalizedEvent:
     """
     Apply rule.pattern (a regex) to raw_event.raw_text. Use rule.field_mappings
@@ -41,6 +112,8 @@ def apply_rule(raw_event: RawEvent, rule: Rule) -> NormalizedEvent:
     
     Raises ValueError if rule.pattern does not match raw_event.raw_text.
     """
+    if rule.pattern == "__JSON__":          # <-- add this branch
+        return _apply_json_rule(raw_event, rule)
     compiled_pattern = re.compile(rule.pattern)
     match = compiled_pattern.search(raw_event.raw_text)
 
