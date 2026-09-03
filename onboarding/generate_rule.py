@@ -67,47 +67,98 @@ FEW_SHOT_EXAMPLE_OUTPUT = {
     ],
 }
 
+# Second few-shot example: prefix-boilerplate log with iptables-style keys.
+# Teaches two things the LEEF example doesn't: (1) skip an arbitrary leading
+# prefix (timestamp/hostname/process) rather than anchoring tightly, and
+# (2) IN=/OUT=/MAC=/LEN= are interface/hardware fields, NOT endpoints —
+# only SRC=/DST=/SPT=/DPT=-style keys are actual source/destination data.
+FEW_SHOT_EXAMPLE_INPUT_2 = """Sample log lines:
+Sep 3 10:05:12 gw02 kernel: FW-DROP: IN=eth1 OUT= MAC=00:1a:2b SRC=10.0.0.5 DST=10.0.0.9 LEN=40 PROTO=TCP SPT=443 DPT=8080 FLAGS=ACK
+Sep 5 22:41:03 gw07 kernel: FW-DROP: IN=eth2 OUT= MAC=aa:bb:cc SRC=10.1.4.2 DST=10.1.4.9 LEN=60 PROTO=UDP SPT=53 DPT=33211 FLAGS=
+"""
+
+FEW_SHOT_EXAMPLE_OUTPUT_2 = {
+    "pattern": (
+        r"^.*?SRC=(?P<src_ip>[\d.]+)\s+DST=(?P<dst_ip>[\d.]+)\s+LEN=\d+\s+"
+        r"PROTO=\w+\s+SPT=(?P<src_port>\d+)\s+DPT=(?P<dst_port>\d+)\s+FLAGS=\S*$"
+    ),
+    "field_mappings": [
+        {"source_field": "src_ip", "ocsf_path": "src_endpoint.ip"},
+        {"source_field": "dst_ip", "ocsf_path": "dst_endpoint.ip"},
+        {"source_field": "src_port", "ocsf_path": "src_endpoint.port"},
+        {"source_field": "dst_port", "ocsf_path": "dst_endpoint.port"},
+    ],
+}
+
+JSON_SENTINEL = "__JSON__"  # rule.pattern value signaling "parse as JSON, not regex"
+
 
 def _build_prompt(sample_lines: list[str]) -> str:
     joined_samples = "\n".join(sample_lines)
     return f"""You are a log-parsing rule generator. You will be given raw log lines
-that all share the same format. Produce a Python regular expression with
-NAMED capture groups (?P<name>...) that matches the structure of these
-lines, plus a mapping from each captured group to a target field.
+of semi-structured text that all share the same format. Produce a Python
+regular expression with NAMED capture groups (?P<name>...) that matches
+the structure of these lines, plus a mapping from each captured group to
+a target field.
 
-IMPORTANT structural note: many security log formats (CEF, LEEF, and
-similar) have TWO distinct parts:
-  1. A pipe-delimited HEADER (vendor, product, version, signature id,
-     name, severity, etc.) at the start of the line.
-  2. An EXTENSION containing key=value pairs separated by whitespace —
-     this is where src/dst/port/action/message fields actually live.
-     Capture groups belong here, one per relevant key=value pair.
+1. Many formats have a HEADER before the meaningful content — either
+   pipe-delimited (CEF, LEEF) or a free-text prefix like a timestamp and
+   hostname (syslog-style). Do NOT try to match the header field-by-field.
+   Use a GREEDY generic skip instead:
+     - pipe-delimited header: use ".*\\|" to skip to the last pipe
+     - free-text prefix: use "^.*?" (non-greedy) to skip to wherever the
+       actual meaningful key=value content begins
+   This works regardless of exactly how many header fields exist.
 
-CRITICAL: do NOT try to count and match the header's pipe-delimited
-fields one at a time with repeated [^|]*\\| segments — different vendors
-use different numbers of header fields, and guessing the wrong count
-will make the pattern fail to match. Instead, since the extension never
-itself contains a pipe character, skip the ENTIRE header generically
-with a single GREEDY wildcard up to the LAST pipe before the extension,
-like this: ^FORMAT:[\\d.]+\\|.*\\|key1=(?P<...>...) — the ".*\\|" part
-consumes all header fields regardless of how many there are.
+2. In firewall/iptables-style logs, IN=, OUT=, MAC=, and LEN= are
+   NETWORK INTERFACE / hardware fields — they are NOT source or
+   destination addresses. Do not map them to endpoint IPs. The real
+   endpoint data is in keys like SRC=, DST=, SPT=, DPT= (or clearly
+   analogous names). Only capture and map fields that are actually
+   source/destination/port/action/message data.
+
+3. CRITICAL — do not hardcode any literal text that is specific to just
+   the sample lines shown to you (a specific hostname, process name, PID,
+   date, or exact interface name). Your pattern must generalize to lines
+   you have NOT seen, which will have DIFFERENT hostnames/timestamps/etc.
+   Anything that varies conceptually (even if by coincidence it happens
+   to look the same across your small sample) must be matched with a
+   generic wildcard (.*? or [\\w-]+ etc.), never typed out literally.
+   In Example 2 below, notice the two sample lines have DIFFERENT
+   hostnames, dates, and interface names on purpose — your pattern must
+   still match both. If your pattern would fail on a line with a
+   hostname you haven't seen before, it is wrong.
 
 Only map fields that clearly correspond to one of these target fields —
 leave other captured groups unmapped if they don't fit:
 {", ".join(OCSF_TARGET_FIELDS)}
 
 Respond with ONLY a JSON object, no other text, no markdown code fences,
-in exactly this shape:
+in exactly this shape. Two worked examples:
 
+Example 1 (pipe-delimited header):
 {FEW_SHOT_EXAMPLE_INPUT}
 Expected output:
 {json.dumps(FEW_SHOT_EXAMPLE_OUTPUT, indent=2)}
+
+Example 2 (free-text prefix, interface fields present but NOT mapped):
+{FEW_SHOT_EXAMPLE_INPUT_2}
+Expected output:
+{json.dumps(FEW_SHOT_EXAMPLE_OUTPUT_2, indent=2)}
 
 Now do the same for these sample lines:
 {joined_samples}
 
 Respond with ONLY the JSON object.
 """
+
+
+def _is_valid_json(line: str) -> bool:
+    try:
+        json.loads(line)
+        return True
+    except json.JSONDecodeError:
+        return False
 
 
 def _extract_json(raw_response: str) -> dict:
@@ -120,6 +171,104 @@ def _extract_json(raw_response: str) -> dict:
     if not match:
         raise ValueError(f"No JSON object found in model response: {raw_response[:200]}")
     return json.loads(match.group(0))
+
+
+def _resolve_json_path(obj: dict, dotted_path: str):
+    """Walk a nested dict using a dotted path like 'alert.severity'.
+    Returns None if any part of the path is missing (never raises)."""
+    current = obj
+    for part in dotted_path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _flatten_json(obj: dict, prefix: str = "") -> dict:
+    """Flatten a nested dict into {dotted.path: value} pairs."""
+    flat = {}
+    for key, value in obj.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            flat.update(_flatten_json(value, path))
+        else:
+            flat[path] = value
+    return flat
+
+
+# Common key-name aliases seen in real security log JSON, matched against
+# the LEAF (last segment) of a flattened dotted path, case-insensitively.
+_JSON_FIELD_ALIASES = {
+    "src_endpoint.ip": ["src_ip", "source_ip", "srcip"],
+    "src_endpoint.port": ["src_port", "source_port", "srcport"],
+    "dst_endpoint.ip": ["dest_ip", "dst_ip", "destination_ip", "dstip"],
+    "dst_endpoint.port": ["dest_port", "dst_port", "destination_port", "dstport"],
+    "time": ["timestamp", "time"],
+    "severity_id": ["severity", "sev"],
+    "action": ["action", "event_type"],
+    "message": ["message", "msg", "signature"],
+}
+
+
+def _generate_json_rule(fingerprint_id: str, sample_lines: list[str]) -> Rule:
+    """
+    Deterministic path for JSON-formatted logs — NO model call. JSON is
+    already self-describing, so we flatten it and match field names
+    against known aliases directly. This is more reliable and much
+    faster than asking an SLM to reverse-engineer a regex for data
+    that's already structured.
+    """
+    parsed_lines = []
+    for line in sample_lines:
+        try:
+            parsed_lines.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    if not parsed_lines:
+        raise ValueError(f"No sample lines for '{fingerprint_id}' parsed as valid JSON")
+
+    # Union of flattened keys across all sample lines, so we catch fields
+    # that only appear in some lines.
+    all_flat_keys = set()
+    for obj in parsed_lines:
+        all_flat_keys.update(_flatten_json(obj).keys())
+
+    field_mappings = []
+    for ocsf_path, aliases in _JSON_FIELD_ALIASES.items():
+        for flat_key in all_flat_keys:
+            leaf = flat_key.split(".")[-1].lower()
+            if leaf in aliases:
+                field_mappings.append(FieldMapping(source_field=flat_key, ocsf_path=ocsf_path))
+                break  # first match wins per target field
+
+    confidence = _compute_json_confidence(sample_lines, field_mappings)
+
+    return Rule(
+        fingerprint_id=fingerprint_id,
+        pattern=JSON_SENTINEL,
+        field_mappings=field_mappings,
+        confidence=confidence,
+        provenance="slm-generated",  # still "generated", just deterministically rather than via model call
+        version=1,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def _compute_json_confidence(sample_lines: list[str], field_mappings: list[FieldMapping]) -> float:
+    """For JSON rules: fraction of sample_lines that parse as JSON AND
+    have every mapped path resolve to a non-null value."""
+    if not sample_lines:
+        return 0.0
+    hits = 0
+    for line in sample_lines:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if all(_resolve_json_path(obj, fm.source_field) is not None for fm in field_mappings):
+            hits += 1
+    return round(hits / len(sample_lines), 2)
 
 
 def _compute_confidence(pattern: str, sample_lines: list[str], expected_groups: list[str]) -> float:
@@ -146,12 +295,20 @@ def _compute_confidence(pattern: str, sample_lines: list[str], expected_groups: 
 
 def generate_rule(fingerprint_id: str, sample_lines: list[str], max_attempts: int = 3) -> Rule:
     """
-    Given raw sample log lines (all believed to be the same format), call
-    the local SLM to infer a regex + OCSF field mapping. Retries on
-    malformed output or a regex that fails to compile.
+    Given raw sample log lines (all believed to be the same format), infer
+    a parsing rule. JSON-formatted logs are detected up front and handled
+    deterministically (no model call — see _generate_json_rule). Everything
+    else goes through the SLM to generate a regex + field mapping, with
+    retries on malformed output or a regex that fails to compile.
     """
     if not sample_lines:
         raise ValueError("generate_rule requires at least one sample line")
+
+    # Detect JSON programmatically rather than trusting the model to
+    # notice — this is more reliable and skips an unnecessary model call.
+    is_json = all(_is_valid_json(line) for line in sample_lines)
+    if is_json:
+        return _generate_json_rule(fingerprint_id, sample_lines)
 
     prompt = _build_prompt(sample_lines)
     last_error = None
@@ -171,17 +328,19 @@ def generate_rule(fingerprint_id: str, sample_lines: list[str], max_attempts: in
 
             pattern = parsed["pattern"]
             raw_mappings = parsed["field_mappings"]
-
-            # validate regex compiles before we trust it
-            re.compile(pattern)
-
             field_mappings = [
                 FieldMapping(source_field=m["source_field"], ocsf_path=m["ocsf_path"])
                 for m in raw_mappings
             ]
-            expected_groups = [m["source_field"] for m in raw_mappings]
 
-            confidence = _compute_confidence(pattern, sample_lines, expected_groups)
+            if pattern == JSON_SENTINEL:
+                # JSON rule: no regex to validate, use JSON-path confidence instead.
+                confidence = _compute_json_confidence(sample_lines, field_mappings)
+            else:
+                # validate regex compiles before we trust it
+                re.compile(pattern)
+                expected_groups = [m["source_field"] for m in raw_mappings]
+                confidence = _compute_confidence(pattern, sample_lines, expected_groups)
 
             return Rule(
                 fingerprint_id=fingerprint_id,
@@ -203,14 +362,7 @@ def generate_rule(fingerprint_id: str, sample_lines: list[str], max_attempts: in
     )
 
 
-if __name__ == "__main__":
-    # Quick manual test against the CEF sample logs.
-    # Run from repo root: python onboarding/generate_rule.py
-    log_path = os.path.join(os.path.dirname(__file__), "..", "testdata", "raw_logs_cef.txt")
-    with open(log_path) as f:
-        lines = [line.strip() for line in f if line.strip()]
-
-    rule = generate_rule("cef_test", lines)
+def _print_rule(rule: Rule):
     print(json.dumps({
         "fingerprint_id": rule.fingerprint_id,
         "pattern": rule.pattern,
@@ -218,3 +370,19 @@ if __name__ == "__main__":
         "confidence": rule.confidence,
         "provenance": rule.provenance,
     }, indent=2))
+
+
+if __name__ == "__main__":
+    # Run from repo root: python onboarding/generate_rule.py
+    base = os.path.join(os.path.dirname(__file__), "..", "testdata")
+
+    for fp_id, filename in [
+        ("cef_test", "raw_logs_cef.txt"),
+        ("syslog_test", "raw_logs_syslog.txt"),
+        ("json_test", "raw_logs_json.txt"),
+    ]:
+        with open(os.path.join(base, filename)) as f:
+            lines = [line.strip() for line in f if line.strip()]
+        print(f"\n=== {fp_id} ===")
+        rule = generate_rule(fp_id, lines)
+        _print_rule(rule)
