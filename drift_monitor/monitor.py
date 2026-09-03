@@ -19,19 +19,26 @@ def compute_null_rate(events, field_path):
 
 
 def classify_severity(current_null_rate, baseline_null_rate):
-    ratio = current_null_rate / baseline_null_rate if baseline_null_rate > 0 else float("inf")
-    difference = current_null_rate - baseline_null_rate
+    current_null_rate = round(current_null_rate, 6)
+    baseline_null_rate = round(baseline_null_rate, 6)
+
+    if baseline_null_rate > 0:
+        ratio = current_null_rate / baseline_null_rate
+    else:
+        ratio = float("inf") if current_null_rate > 0 else 1.0
+
+    difference = round(current_null_rate - baseline_null_rate, 6)
 
     if ratio < 3 or difference < 0.05:
         return "none"
-    elif ratio <= 6:
+    elif ratio < 10:
         return "minor"
-    elif ratio <= 15:
+    elif ratio < 40:
         return "moderate"
     else:
         return "severe"
-
-
+    
+    
 def check_drift(fingerprint_id, field_path, events, baseline_null_rate):
     null_rate = compute_null_rate(events, field_path)
     severity = classify_severity(null_rate, baseline_null_rate)
