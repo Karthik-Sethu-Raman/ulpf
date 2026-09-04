@@ -8,6 +8,7 @@ cheap, deterministic first pass that catches obviously broken rules
 before wasting a reviewer's time on them.
 """
 import re
+import json  
 
 from schemas.schemas import Rule, ValidationResult
 
@@ -21,6 +22,49 @@ _IP_PATTERN = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
 # theirs, since we're validating rules against the same interpretation
 # P2 will actually use when applying them for real.
 _EXTENSION_KV_PATTERN = re.compile(r'(\w+)=(?:"([^"]*)"|([^=]+?)(?=\s+\w+=|$))')
+
+def _resolve_json_path(obj: dict, dotted_path: str):
+    """Walk a nested dict using a dotted path like 'alert.severity'."""
+    current = obj
+    for part in dotted_path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _validate_json_rule(rule: Rule, held_out_lines: list[str]) -> ValidationResult:
+    """Validates a JSON-sentinel rule: every held-out line must parse as
+    JSON AND every mapped dotted-path field must resolve to a value."""
+    notes: list[str] = []
+    all_parse = True
+    all_fields_present = True
+
+    for i, line in enumerate(held_out_lines):
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            all_parse = False
+            notes.append(f"Line {i}: not valid JSON — {line!r}")
+            continue
+
+        for fm in rule.field_mappings:
+            if _resolve_json_path(obj, fm.source_field) is None:
+                all_fields_present = False
+                notes.append(f"Line {i}: path '{fm.source_field}' -> {fm.ocsf_path} not found")
+
+    checks = {
+        "all_lines_parse_as_json": all_parse,
+        "all_mapped_fields_present": all_fields_present,
+    }
+    passed = all(checks.values())
+
+    return ValidationResult(
+        rule_fingerprint_id=rule.fingerprint_id,
+        passed=passed,
+        checks=checks,
+        notes=" | ".join(notes) if notes else "All checks passed on all held-out lines.",
+    )
 
 
 def _parse_extension_kv(extension_str: str) -> dict[str, str]:
@@ -58,6 +102,8 @@ def validate_rule(rule: Rule, held_out_lines: list[str]) -> ValidationResult:
     generate the rule). passed is True only if every check below passes
     on every held-out line.
     """
+    if rule.pattern == "__JSON__":
+        return _validate_json_rule(rule, held_out_lines)
     notes: list[str] = []
 
     if not held_out_lines:
