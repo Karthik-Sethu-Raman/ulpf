@@ -1,3 +1,16 @@
 CEF:0|PaloAlto|PAN-OS|10.1|THREAT|spyware|5|src=203.0.113.45 dst=192.168.1.10 spt=51422 dpt=443 act=block cat=spyware msg=Suspicious DNS Query
 CEF:0|PaloAlto|PAN-OS|10.1|THREAT|malware|7|src=198.51.100.22 dst=192.168.1.14 spt=44521 dpt=80 act=alert cat=malware msg=Known bad hash
 CEF:0|CiscoASA|ASA|9.1|106023|Deny|4|src=203.0.113.90 dst=192.168.1.20 spt=51500 dpt=22 act=deny
+CEF:0|PaloAlto|PAN-OS|10.1|THREAT|spyware|3|src=192.0.2.15 dst=192.168.1.22 spt=52011 dpt=443 act=allow cat=spyware msg=Low confidence match
+CEF:0|PaloAlto|PAN-OS|10.1|THREAT|exploit|9|src=203.0.113.77 dst=192.168.1.10 spt=33210 dpt=3389 act=block cat=exploit msg=RDP brute force attempt
+CEF:0|CiscoASA|ASA|9.1|106023|Deny|4|src=198.51.100.5 dst=192.168.1.30 spt=41022 dpt=25 act=deny
+CEF:0|CiscoASA|ASA|9.1|106100|Permit|2|src=203.0.113.12 dst=192.168.1.40 spt=60011 dpt=443 act=allow
+CEF:0|CiscoASA|ASA|9.1|106023|Deny|6|src=192.0.2.201 dst=192.168.1.15 spt=51900 dpt=3389 act=deny
+CEF:0|FortiGate|FortiOS|7.2|virus|eicar|8|src=203.0.113.33 dst=192.168.1.50 spt=49213 dpt=80 act=block cat=virus msg=EICAR test file detected
+CEF:0|FortiGate|FortiOS|7.2|traffic|forward|1|src=192.168.1.60 dst=8.8.8.8 spt=53211 dpt=53 act=allow cat=dns msg=Normal DNS lookup
+CEF:0|FortiGate|FortiOS|7.2|ips|signature|7|src=198.51.100.90 dst=192.168.1.12 spt=44012 dpt=445 act=block cat=exploit msg=SMB exploit attempt CVE-2020-0796
+CEF:0|PaloAlto|PAN-OS|10.1|THREAT|c2|10|src=192.168.1.18 dst=203.0.113.201 spt=51555 dpt=8443 act=block cat=command-and-control msg=Beaconing to known C2 domain
+CEF:0|PaloAlto|PAN-OS|10.1|THREAT|scan|5|src=203.0.113.44 dst=192.168.1.0 spt=40000 dpt=21 act=alert cat=scan msg=Port scan detected
+CEF:0|CiscoASA|ASA|9.1|106023|Deny|3|src=203.0.113.150 dst=192.168.1.99 spt=59012 dpt=8080 act=deny
+CEF:0|FortiGate|FortiOS|7.2|webfilter|blocked|4|src=192.168.1.70 dst=203.0.113.220 spt=52890 dpt=443 act=block cat=web-filter msg=Blocked category gambling
+CEF:0|PaloAlto|PAN-OS|10.1|THREAT|vulnerability|6|src=198.51.100.61 dst=192.168.1.5 spt=48822 dpt=443 act=alert cat=vulnerability msg=SSL certificate anomaly detected
