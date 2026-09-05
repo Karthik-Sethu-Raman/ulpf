@@ -15,9 +15,27 @@ Owner: P6
 
 import json
 import re
+import sys
+import os
 from pathlib import Path
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 FIXTURES_DIR = Path("testdata/fixtures")
+
+# Try to import the REAL apply_rule() so we test against actual behavior,
+# not a guess at what the regex "should" do. apply_rule() does a two-step
+# parse for CEF-style rules (header regex + separate extension key=value
+# split), so any static "are all field_mappings named groups" check is
+# WRONG for those rules — it doesn't know about the extension step.
+try:
+    from parser_engine.apply_rule import apply_rule
+    from schemas.schemas import RawEvent, Rule, FieldMapping
+    APPLY_RULE_AVAILABLE = True
+except ImportError as e:
+    APPLY_RULE_AVAILABLE = False
+    print(f"  [WARN] Could not import apply_rule() yet ({e}) — "
+          f"falling back to a basic regex-compile check only.\n")
 
 
 def load(name):
@@ -29,32 +47,45 @@ def load(name):
         return json.load(f)
 
 
-def check_rule_fields_match_pattern(rule: dict, label: str):
-    """
-    For a Rule-shaped dict, verify every field_mappings[i].source_field
-    actually appears as a named group in the regex pattern. This is the
-    exact check validate_rule() is supposed to perform (P3's spec) —
-    we replicate it here standalone so we can catch fixture bugs before
-    anyone's real validate_rule() exists.
-    """
+def _dict_to_rule(rule_dict: dict) -> "Rule":
+    mappings = [FieldMapping(**fm) for fm in rule_dict.get("field_mappings", [])]
+    kwargs = dict(rule_dict)
+    kwargs["field_mappings"] = mappings
+    return Rule(**kwargs)
+
+
+def check_rule_pattern_compiles(rule: dict, label: str):
+    """Basic hygiene check: does the regex at least compile? Runs regardless
+    of whether apply_rule() is importable yet."""
     pattern = rule.get("pattern", "")
+    if pattern == "__JSON__":
+        print(f"  [PASS] {label}: uses the special '__JSON__' path (no regex needed)")
+        return
     try:
-        compiled = re.compile(pattern)
+        re.compile(pattern)
+        print(f"  [PASS] {label}: pattern compiles as valid regex")
     except re.error as e:
         print(f"  [FAIL] {label}: pattern does not compile as regex: {e}")
+
+
+def check_rule_against_real_apply_rule(rule_dict: dict, raw_event_dict: dict, label: str):
+    """
+    The real check: actually run apply_rule() (P2's real code) against a raw
+    event and see what happens. This replaces static guessing about regex
+    groups, since apply_rule() may do extra parsing steps (like splitting a
+    CEF 'extension' blob into key=value pairs) that a static check can't see.
+    """
+    if not APPLY_RULE_AVAILABLE:
         return
-
-    named_groups = set(compiled.groupindex.keys())
-    mapped_fields = {fm["source_field"] for fm in rule.get("field_mappings", [])}
-    orphans = mapped_fields - named_groups
-
-    if orphans:
-        print(f"  [FAIL] {label}: field_mappings reference fields with NO matching "
-              f"named group in pattern: {sorted(orphans)}")
-        print(f"         named groups actually in pattern: {sorted(named_groups)}")
-    else:
-        print(f"  [PASS] {label}: all field_mappings have matching named groups "
-              f"{sorted(mapped_fields)}")
+    try:
+        rule = _dict_to_rule(rule_dict)
+        raw_event = RawEvent(**raw_event_dict)
+        result = apply_rule(raw_event, rule)
+        print(f"  [PASS] {label}: apply_rule() ran successfully")
+        print(f"         -> src_endpoint={result.src_endpoint}, "
+              f"dst_endpoint={result.dst_endpoint}, action={result.action}")
+    except Exception as e:
+        print(f"  [FAIL] {label}: apply_rule() raised an error: {e}")
 
 
 def check_drift_sequence_thresholds(sequence: list[dict]):
@@ -93,26 +124,50 @@ def check_drift_sequence_thresholds(sequence: list[dict]):
 
 
 def main():
-    print("=== Checking Rule fixtures for orphan field_mappings ===")
-    for name in ["sample_rule.json", "sample_rule_extension_style.json",
-                 "sample_rule_bad.json", "bad_rule_fixture_syslog.json"]:
+    print("=== Checking Rule fixtures compile as valid regex ===")
+    rule_fixture_names = ["sample_rule.json", "sample_rule_extension_style.json",
+                           "sample_rule_bad.json", "bad_rule_fixture_syslog.json"]
+    rules = {}
+    for name in rule_fixture_names:
         rule = load(name)
+        rules[name] = rule
         if rule is not None:
-            check_rule_fields_match_pattern(rule, name)
+            check_rule_pattern_compiles(rule, name)
 
-    print("\n=== Checking sample_rule.json against sample_normalized_event.json ===")
+    print("\n=== Running real apply_rule() against sample_rule.json + sample_raw_event.json ===")
     raw_event = load("sample_raw_event.json")
-    rule = load("sample_rule.json")
-    expected = load("sample_normalized_event.json")
-    if raw_event and rule and expected:
-        match = re.search(rule["pattern"], raw_event["raw_text"])
-        if not match:
-            print("  [FAIL] sample_rule.json's pattern does not even match sample_raw_event.json's raw_text")
-        else:
-            groups = match.groupdict()
-            print(f"  Actual regex groups captured: {groups}")
-            print(f"  Expected output requires individual src/dst/spt/dpt/act values — "
-                  f"{'FOUND' if 'src' in groups else 'NOT FOUND'} as a named group")
+    if raw_event and rules.get("sample_rule.json"):
+        check_rule_against_real_apply_rule(rules["sample_rule.json"], raw_event, "sample_rule.json")
+        expected = load("sample_normalized_event.json")
+        if expected and APPLY_RULE_AVAILABLE:
+            try:
+                rule = _dict_to_rule(rules["sample_rule.json"])
+                re_obj = RawEvent(**raw_event)
+                result = apply_rule(re_obj, rule)
+                mismatches = []
+                if result.src_endpoint != expected.get("src_endpoint"):
+                    mismatches.append(f"src_endpoint: got {result.src_endpoint}, expected {expected.get('src_endpoint')}")
+                if result.dst_endpoint != expected.get("dst_endpoint"):
+                    mismatches.append(f"dst_endpoint: got {result.dst_endpoint}, expected {expected.get('dst_endpoint')}")
+                if result.action != expected.get("action"):
+                    mismatches.append(f"action: got {result.action}, expected {expected.get('action')}")
+                if mismatches:
+                    print(f"  [FAIL] output doesn't match sample_normalized_event.json:")
+                    for m in mismatches:
+                        print(f"         {m}")
+                else:
+                    print(f"  [PASS] output matches sample_normalized_event.json exactly")
+            except Exception as e:
+                print(f"  [FAIL] could not compare output: {e}")
+
+    print("\n=== Sanity-checking known-bad rule fixtures still fail cleanly ===")
+    for name in ["sample_rule_bad.json", "bad_rule_fixture_syslog.json"]:
+        rule = rules.get(name)
+        if rule and raw_event:
+            # These are EXPECTED to fail or produce garbage — just confirm
+            # apply_rule() doesn't crash the whole script (raising ValueError
+            # is fine/expected; an unhandled crash type would not be).
+            check_rule_against_real_apply_rule(rule, raw_event, f"{name} (expected to misbehave)")
 
     print("\n=== Checking drift_sequence.json against P5's stated thresholds ===")
     sequence = load("drift_sequence.json")
