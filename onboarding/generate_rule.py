@@ -52,18 +52,15 @@ LEEF:2.0|Acme|NetGuard|3.2|402|src=203.0.113.9 srcPort=51002 dst=192.168.1.6 dst
 
 FEW_SHOT_EXAMPLE_OUTPUT = {
     "pattern": (
-        r"^LEEF:[\d.]+\|.*\|"
-        r"src=(?P<src_ip>[\d.]+)\s+srcPort=(?P<src_port>\d+)\s+"
-        r"dst=(?P<dst_ip>[\d.]+)\s+dstPort=(?P<dst_port>\d+)\s+"
-        r"proto=\w+\s+action=(?P<action>\w+)\s+msg=(?P<message>.*)$"
+        r"^.*\|(?P<extension>.*)$"
     ),
     "field_mappings": [
-        {"source_field": "src_ip", "ocsf_path": "src_endpoint.ip"},
-        {"source_field": "src_port", "ocsf_path": "src_endpoint.port"},
-        {"source_field": "dst_ip", "ocsf_path": "dst_endpoint.ip"},
-        {"source_field": "dst_port", "ocsf_path": "dst_endpoint.port"},
+        {"source_field": "src", "ocsf_path": "src_endpoint.ip"},
+        {"source_field": "srcPort", "ocsf_path": "src_endpoint.port"},
+        {"source_field": "dst", "ocsf_path": "dst_endpoint.ip"},
+        {"source_field": "dstPort", "ocsf_path": "dst_endpoint.port"},
         {"source_field": "action", "ocsf_path": "action"},
-        {"source_field": "message", "ocsf_path": "message"},
+        {"source_field": "msg", "ocsf_path": "message"},
     ],
 }
 
@@ -79,14 +76,13 @@ Sep 5 22:41:03 gw07 kernel: FW-DROP: IN=eth2 OUT= MAC=aa:bb:cc SRC=10.1.4.2 DST=
 
 FEW_SHOT_EXAMPLE_OUTPUT_2 = {
     "pattern": (
-        r"^.*?SRC=(?P<src_ip>[\d.]+)\s+DST=(?P<dst_ip>[\d.]+)\s+LEN=\d+\s+"
-        r"PROTO=\w+\s+SPT=(?P<src_port>\d+)\s+DPT=(?P<dst_port>\d+)\s+FLAGS=\S*$"
+        r"^.*?FW-DROP:\s*(?P<extension>.*)$"
     ),
     "field_mappings": [
-        {"source_field": "src_ip", "ocsf_path": "src_endpoint.ip"},
-        {"source_field": "dst_ip", "ocsf_path": "dst_endpoint.ip"},
-        {"source_field": "src_port", "ocsf_path": "src_endpoint.port"},
-        {"source_field": "dst_port", "ocsf_path": "dst_endpoint.port"},
+        {"source_field": "SRC", "ocsf_path": "src_endpoint.ip"},
+        {"source_field": "DST", "ocsf_path": "dst_endpoint.ip"},
+        {"source_field": "SPT", "ocsf_path": "src_endpoint.port"},
+        {"source_field": "DPT", "ocsf_path": "dst_endpoint.port"},
     ],
 }
 
@@ -105,29 +101,30 @@ a target field.
    pipe-delimited (CEF, LEEF) or a free-text prefix like a timestamp and
    hostname (syslog-style). Do NOT try to match the header field-by-field.
    Use a GREEDY generic skip instead:
-     - pipe-delimited header: use ".*\\|" to skip to the last pipe
+     - pipe-delimited header: use "^.*\\|" to skip to the last pipe
      - free-text prefix: use "^.*?" (non-greedy) to skip to wherever the
        actual meaningful key=value content begins
    This works regardless of exactly how many header fields exist.
 
-2. In firewall/iptables-style logs, IN=, OUT=, MAC=, and LEN= are
+2. If the meaningful content consists of space-separated key=value pairs
+   (e.g., src=1.2.3.4 dst=5.6.7.8), do NOT try to match each pair individually.
+   Instead, capture the ENTIRE key=value remainder of the line in a single
+   named group called (?P<extension>.*). Our system will automatically parse
+   the key=value pairs inside the extension blob. The source_field in your
+   mappings must exactly match the key name from the log (e.g. "src", "dstPort").
+
+3. In firewall/iptables-style logs, IN=, OUT=, MAC=, and LEN= are
    NETWORK INTERFACE / hardware fields — they are NOT source or
    destination addresses. Do not map them to endpoint IPs. The real
    endpoint data is in keys like SRC=, DST=, SPT=, DPT= (or clearly
    analogous names). Only capture and map fields that are actually
    source/destination/port/action/message data.
 
-3. CRITICAL — do not hardcode any literal text that is specific to just
+4. CRITICAL — do not hardcode any literal text that is specific to just
    the sample lines shown to you (a specific hostname, process name, PID,
    date, or exact interface name). Your pattern must generalize to lines
    you have NOT seen, which will have DIFFERENT hostnames/timestamps/etc.
-   Anything that varies conceptually (even if by coincidence it happens
-   to look the same across your small sample) must be matched with a
-   generic wildcard (.*? or [\\w-]+ etc.), never typed out literally.
-   In Example 2 below, notice the two sample lines have DIFFERENT
-   hostnames, dates, and interface names on purpose — your pattern must
-   still match both. If your pattern would fail on a line with a
-   hostname you haven't seen before, it is wrong.
+   Anything that varies conceptually must be matched with a generic wildcard.
 
 Only map fields that clearly correspond to one of these target fields —
 leave other captured groups unmapped if they don't fit:
@@ -271,6 +268,18 @@ def _compute_json_confidence(sample_lines: list[str], field_mappings: list[Field
     return round(hits / len(sample_lines), 2)
 
 
+_EXTENSION_KV_PATTERN = re.compile(r'(\w+)=(?:"([^"]*)"|([^=]+?)(?=\s+\w+=|$))')
+
+def _parse_extension_kv(extension_str: str) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    if not extension_str:
+        return pairs
+    for match in _EXTENSION_KV_PATTERN.finditer(extension_str):
+        key = match.group(1)
+        value = match.group(2) if match.group(2) is not None else match.group(3)
+        pairs[key] = value.strip()
+    return pairs
+
 def _compute_confidence(pattern: str, sample_lines: list[str], expected_groups: list[str]) -> float:
     """Fraction of sample_lines where the pattern matches AND all named
     groups it defines come back non-empty."""
@@ -287,8 +296,12 @@ def _compute_confidence(pattern: str, sample_lines: list[str], expected_groups: 
         m = compiled.search(line)
         if not m:
             continue
-        groupdict = m.groupdict()
-        if all(groupdict.get(g) for g in expected_groups):
+        fields = dict(m.groupdict())
+        extension_text = fields.get("extension")
+        if extension_text:
+            fields.update(_parse_extension_kv(extension_text))
+            
+        if all(fields.get(g) for g in expected_groups):
             hits += 1
     return round(hits / len(sample_lines), 2)
 
@@ -310,18 +323,32 @@ def generate_rule(fingerprint_id: str, sample_lines: list[str], max_attempts: in
     if is_json:
         return _generate_json_rule(fingerprint_id, sample_lines)
 
-    prompt = _build_prompt(sample_lines)
-    last_error = None
+    # Cap how many lines actually go INTO the prompt. More samples can
+    # help a large model generalize better, but empirically made a 3B
+    # model scramble field order (attention dilution) rather than help —
+    # 3-5 well-chosen lines are enough to show the pattern's shape.
+    # Confidence is still checked against the FULL sample_lines set below,
+    # so this doesn't weaken validation, only what the model has to read.
+    MAX_PROMPT_SAMPLES = 5
+    prompt_lines = sample_lines[:MAX_PROMPT_SAMPLES]
 
+    prompt = _build_prompt(prompt_lines)
+    last_error = None
+    last_generated_rule = None
+
+    messages = [{"role": "user", "content": prompt}]
+    
     for attempt in range(1, max_attempts + 1):
         try:
             response = ollama.chat(
                 model=MODEL_NAME,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
                 format="json",
-                options={"temperature": 0.1},
+                options={"temperature": 0.1 + (attempt - 1) * 0.2},
             )
             content = response["message"]["content"]
+            messages.append({"role": "assistant", "content": content})
+            
             if os.environ.get("ULPF_DEBUG"):
                 print(f"--- raw model response (attempt {attempt}) ---\n{content}\n---", file=sys.stderr)
             parsed = _extract_json(content)
@@ -341,8 +368,8 @@ def generate_rule(fingerprint_id: str, sample_lines: list[str], max_attempts: in
                 re.compile(pattern)
                 expected_groups = [m["source_field"] for m in raw_mappings]
                 confidence = _compute_confidence(pattern, sample_lines, expected_groups)
-
-            return Rule(
+            
+            rule = Rule(
                 fingerprint_id=fingerprint_id,
                 pattern=pattern,
                 field_mappings=field_mappings,
@@ -352,9 +379,19 @@ def generate_rule(fingerprint_id: str, sample_lines: list[str], max_attempts: in
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
 
+            if confidence == 0.0:
+                last_generated_rule = rule
+                raise ValueError("Generated rule yielded 0.0 confidence. It failed to match the samples. Try a simpler regex.")
+
+            return rule
+
         except (json.JSONDecodeError, KeyError, re.error, ValueError) as e:
             last_error = e
+            messages.append({"role": "user", "content": f"That rule failed with error: {str(e)}\nPlease try again and fix the issue."})
             continue
+
+    if last_generated_rule is not None:
+        return last_generated_rule
 
     raise RuntimeError(
         f"Failed to generate a valid rule for fingerprint '{fingerprint_id}' "

@@ -58,7 +58,7 @@ except Exception:
 
 # Known fingerprint for the CEF PaloAlto rule everyone's been testing
 # against since day 1 -- update this if the demo's target format changes.
-DEFAULT_FINGERPRINT_ID = "cef_paloalto_v1"
+DEFAULT_FINGERPRINT_ID = "cef_paloalto"
 
 
 def _load_json(filename: str):

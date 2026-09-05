@@ -1,5 +1,4 @@
 {
-    "_note": "Real example of a low-confidence SLM-generated rule, captured from an actual run. Use this as a test fixture for validate_rule() to confirm it correctly rejects a rule that partially reverts to hardcoding structural assumptions about the prefix instead of using a fully generic skip. This should FAIL validation (confidence 0.0, doesn't match held-out lines).",
     "fingerprint_id": "syslog_test",
     "pattern": "^\\s*\\w+ \\d+ \\d+: \\d+:.*?SRC=(?P<src_ip>[\\d.]+)\\s+DST=(?P<dst_ip>[\\d.]+)\\s+LEN=\\d+\\s+PROTO=\\w+\\s+SPT=(?P<src_port>\\d+)\\s+DPT=(?P<dst_port>\\d+)\\s+FLAGS=\\S*$",
     "field_mappings": [
