@@ -1,0 +1,10 @@
+ACMEGW|v3|2026-08-27T14:32:07+05:30|type:conn-deny|source=203.0.113.45:51422|target=192.168.1.10:22|proto=tcp|reason=blacklist-match|sev=high
+ACMEGW|v3|2026-08-27T14:34:12+05:30|type:conn-allow|source=192.168.1.60:53211|target=8.8.8.8:53|proto=udp|reason=policy-ok|sev=info
+ACMEGW|v3|2026-08-27T14:36:47+05:30|type:conn-deny|source=198.51.100.22:44521|target=192.168.1.14:80|proto=tcp|reason=known-bad-ip|sev=high
+ACMEGW|v3|2026-08-27T14:38:30+05:30|type:conn-deny|source=203.0.113.90:51500|target=192.168.1.20:3389|proto=tcp|reason=brute-force|sev=critical
+ACMEGW|v3|2026-08-27T14:40:05+05:30|type:conn-allow|source=192.168.1.70:52890|target=203.0.113.220:443|proto=tcp|reason=policy-ok|sev=info
+ACMEGW|v3|2026-08-27T14:41:41+05:30|type:conn-deny|source=192.0.2.201:51900|target=192.168.1.15:3389|proto=tcp|reason=brute-force|sev=critical
+ACMEGW|v3|2026-08-27T14:43:02+05:30|type:conn-deny|source=203.0.113.33:49213|target=192.168.1.50:80|proto=tcp|reason=malware-signature|sev=high
+ACMEGW|v3|2026-08-27T14:45:15+05:30|type:conn-deny|source=198.51.100.90:44012|target=192.168.1.12:445|proto=tcp|reason=exploit-attempt|sev=critical
+ACMEGW|v3|2026-08-27T14:46:29+05:30|type:conn-allow|source=192.168.1.18:60011|target=8.8.4.4:53|proto=udp|reason=policy-ok|sev=info
+ACMEGW|v3|2026-08-27T14:47:03+05:30|type:conn-deny|source=203.0.113.150:59012|target=192.168.1.99:8080|proto=tcp|reason=proxy-abuse|sev=medium
