@@ -91,24 +91,29 @@ def check_rule_against_real_apply_rule(rule_dict: dict, raw_event_dict: dict, la
 def check_drift_sequence_thresholds(sequence: list[dict]):
     """
     Cross-check each drift_sequence.json entry's stated 'severity' against
-    P5's own documented thresholds:
+    P5's REAL, current thresholds as implemented in drift_monitor/monitor.py
+    (classify_severity) — NOT the original role-doc thresholds, which P5
+    has since revised:
       ratio < 3x (or absolute diff < 0.05) -> none
-      3x-6x   -> minor
-      6x-15x  -> moderate
-      >15x    -> severe
+      3x-10x   -> minor
+      10x-40x  -> moderate
+      >=40x    -> severe
     Flags any mismatch so it can be raised with P5 before Day 3.
+    Update this function again if monitor.py's thresholds change further.
     """
     def expected_severity(null_rate, baseline):
-        if baseline == 0:
-            ratio = float("inf") if null_rate > 0 else 1.0
-        else:
+        null_rate = round(null_rate, 6)
+        baseline = round(baseline, 6)
+        if baseline > 0:
             ratio = null_rate / baseline
-        diff = null_rate - baseline
+        else:
+            ratio = float("inf") if null_rate > 0 else 1.0
+        diff = round(null_rate - baseline, 6)
         if ratio < 3 or diff < 0.05:
             return "none"
-        elif ratio < 6:
+        elif ratio < 10:
             return "minor"
-        elif ratio < 15:
+        elif ratio < 40:
             return "moderate"
         else:
             return "severe"
