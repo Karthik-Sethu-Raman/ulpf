@@ -8,4 +8,5 @@ legacy-demo
 **/*.egg-info
 .venv
 node_modules
+**/node_modules
 .pytest_cache
