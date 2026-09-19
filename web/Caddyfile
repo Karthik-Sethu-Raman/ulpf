@@ -1,0 +1,23 @@
+# web/Caddyfile — serves the built SPA and reverse-proxies /api/* to the
+# gateway. Same-origin only: the gateway ships no CORS, and this is the only
+# front door in production.
+#
+# NOTE (deviation from the plan's literal snippet): try_files/file_server and
+# reverse_proxy cannot share one scope here — Caddy's canonical directive
+# order runs try_files BEFORE reverse_proxy, so an unmatched /api/stats was
+# rewritten to /index.html before the /api/* matcher was evaluated and the
+# API silently served the SPA (verified empirically with caddy:2-alpine:
+# GET /api/stats returned 200 text/html). Two `handle` blocks enforce the
+# routing explicitly; verified: / -> SPA, /api/* -> proxy (502 when gateway
+# is down, not index.html). Caddy detects text/event-stream and streams SSE
+# unbuffered.
+:3000 {
+	root * /srv
+	handle /api/* {
+		reverse_proxy gateway:8000
+	}
+	handle {
+		try_files {path} /index.html
+		file_server
+	}
+}

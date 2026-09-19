@@ -1,0 +1,10 @@
+[tool.pytest.ini_options]
+testpaths = ["libs", "services", "simulator"]
+pythonpath = [".", "services/collector", "services/pipeline", "services/gateway", "simulator"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# legacy-demo/ is the frozen hackathon demo (out of M1 scope; its suite must
+# never even be collected) — not held to this repo's lint rules.
+extend-exclude = ["legacy-demo"]

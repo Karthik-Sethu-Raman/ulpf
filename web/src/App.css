@@ -1,0 +1,244 @@
+/* web/src/App.css — Overview page styles.
+   Air-gap rules: system font stack only, no external fonts/icons/CDN. */
+
+:root {
+  color-scheme: dark;
+  --bg: #0e1116;
+  --panel: #161b22;
+  --panel-2: #1c222b;
+  --border: #2a313c;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #4493f8;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+  --quar: #a371f7;
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.mono {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, 'Courier New', monospace;
+  font-size: 0.92em;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 16px 24px 48px;
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 10px;
+  margin-bottom: 16px;
+}
+
+.topbar h1 {
+  font-size: 20px;
+  margin: 0;
+}
+
+.banner-error {
+  background: rgba(248, 81, 73, 0.12);
+  border: 1px solid var(--err);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 0 0 16px;
+  color: var(--err);
+}
+
+/* --- stat cards ------------------------------------------------------- */
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+
+.card-value {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.card-label {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-top: 4px;
+}
+
+/* --- live feed table --------------------------------------------------- */
+
+.feed {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.feed-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.feed-table th,
+.feed-table td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.feed-table thead th {
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  position: sticky;
+  top: 0;
+}
+
+.feed-table tbody tr {
+  cursor: pointer;
+}
+
+.feed-table tbody tr:hover,
+.feed-table tbody tr:focus-visible {
+  background: var(--panel-2);
+  outline: none;
+}
+
+.feed-table .empty {
+  text-align: center;
+  padding: 32px 12px;
+  cursor: default;
+}
+
+.badge {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 1px 9px;
+  font-size: 12px;
+  border: 1px solid currentColor;
+}
+
+.badge-parsed      { color: var(--ok); }
+.badge-unparsed    { color: var(--warn); }
+.badge-parse_error { color: var(--err); }
+.badge-quarantined { color: var(--quar); }
+
+/* --- traceability drawer ----------------------------------------------- */
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(520px, 92vw);
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  box-shadow: -12px 0 32px rgba(0, 0, 0, 0.45);
+  padding: 16px 20px 32px;
+  overflow-y: auto;
+  z-index: 10;
+}
+
+.drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.drawer-head h2 {
+  font-size: 16px;
+  margin: 0;
+}
+
+.drawer-close {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.drawer-close:hover {
+  border-color: var(--accent);
+}
+
+.drawer h3 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 18px 0 6px;
+}
+
+.drawer-error {
+  color: var(--err);
+  background: rgba(248, 81, 73, 0.12);
+  border: 1px solid var(--err);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+
+.code {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, 'Courier New', monospace;
+  font-size: 12px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 4px 12px;
+  margin: 8px 0;
+  font-size: 13px;
+}
+
+.kv dt {
+  color: var(--muted);
+}
+
+.kv dd {
+  margin: 0;
+  word-break: break-all;
+}

@@ -1,0 +1,4 @@
+confluent-kafka==2.5.0
+psycopg[binary]==3.2.1
+regex~=2024.7     # controller R8: no cp313 wheel for ==2024.7.24; ~= matches ulpf-core's own pin
+jsonschema==4.23.0  # canary: ocsf_schema.validator (spec §6.4)

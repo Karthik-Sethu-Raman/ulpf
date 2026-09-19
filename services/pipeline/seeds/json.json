@@ -1,0 +1,15 @@
+{
+  "fingerprint_id": "json",
+  "pattern": "__JSON__",
+  "mappings": [
+    {"source_field": "src_ip", "ocsf_path": "src_endpoint.ip"},
+    {"source_field": "src_port", "ocsf_path": "src_endpoint.port"},
+    {"source_field": "dest_ip", "ocsf_path": "dst_endpoint.ip"},
+    {"source_field": "dest_port", "ocsf_path": "dst_endpoint.port"},
+    {"source_field": "timestamp", "ocsf_path": "time"},
+    {"source_field": "alert.severity", "ocsf_path": "severity_id"},
+    {"source_field": "event_type", "ocsf_path": "action"},
+    {"source_field": "alert.signature", "ocsf_path": "message"}
+  ],
+  "corpus": "raw_logs_json.txt"
+}

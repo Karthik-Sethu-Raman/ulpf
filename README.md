@@ -1,104 +1,47 @@
 # ULPF — Universal Log Pre-processing Framework
 
-A prototype built for Smart India Hackathon 2026, Problem Statement 26156
-(NTRO, Blockchain & Cybersecurity theme).
+SIH 2026 PS 26156 MVP. Status: M1 walking skeleton complete — the milestone
+exit is `python scripts/smoke.py` (all 5 checks PASS).
 
-## What this is
+- `services/` — collector, pipeline, gateway (+ onboarding, drift in M2/M3)
+- `libs/ulpf-core` — fingerprinting, parsing, IDs, hash chain (single implementation)
+- `libs/ocsf-schema` — curated OCSF subset schema + validator
+- `web/` — React dashboard
+- `simulator/` — multi-vendor traffic player
+- `deploy/` — docker-compose, migrations
+- `scripts/smoke.py` — M1 acceptance gate (live E2E incl. forced replay)
+- `legacy-demo/` — the original hackathon demo, frozen. See its README.
 
-ULPF ingests security logs from perimeter network devices (firewalls,
-IDS, VPN gateways) in heterogeneous vendor formats — Syslog, CEF, LEEF,
-JSON, CSV, and undocumented proprietary formats — and normalizes them
-into a common schema (OCSF) for SIEM and analytics use.
+## Quickstart (M1)
 
-The core design idea: when a genuinely new, unrecognized log format
-appears, a small local language model (SLM) proposes a parsing rule
-(a regex + field mapping) from a handful of sample lines. A human
-reviews, edits, or overrides that candidate before it's trusted on real
-traffic. From that point on, parsing is fully deterministic — the model
-is never called again for that format unless it later drifts.
-
-## Architecture
-
-```
-Perimeter device logs
-        |
-   Ingestion + raw storage (immutable, before any processing)
-        |
-   Format fingerprinting (deterministic, no model calls)
-        |
-   Known format? ----no----> SLM generates candidate rule
-        |                          |
-       yes                    Human review (approve/edit/override)
-        |                          |
-   Deterministic parser  <---------+
-        |
-   Normalized OCSF event (linked to raw log for traceability)
-        |
-   Drift monitoring (continuous; degraded rules fail closed)
-        |
-   SIEM / data lake
+```bash
+cd deploy && docker compose --profile sim up -d --build
+python scripts/smoke.py          # end-to-end acceptance incl. forced replay
+open http://localhost:3000       # Overview: live feed + raw traceability
+# sustained live traffic for the dashboard (the --profile sim one-shot above
+# exits after its single ~56-line pass):
+docker compose run --rm simulator --eps 20 --duration 300 --loop
 ```
 
-Full technical rationale, design decisions, and references are in
-`docs/`.
+The smoke runs the simulator over the golden corpora, then verifies: lossless
+ingest (raw delta == sent), the parsed/unparsed split per fingerprint, raw
+traceability (API + SQL join with recomputed sha256), forced replay
+idempotency (Kafka consumer-group delete + pipeline restart: raw events
+unchanged, raw_batches grown), and an independent recomputation of every
+raw_batches merkle root plus full per-partition chain linkage.
 
-## Repo structure
+Smoke host deps (Python 3.13 tested): `psycopg[binary]` only. No confluent-kafka
+on the host: Kafka interaction goes through `docker compose exec redpanda rpk`,
+and the simulator runs in its own container (the services'
+`confluent-kafka==2.5.0` pin is in-image only, py3.12). The smoke is
+delta-based: the database is never reset, so re-runs accumulate and re-verify
+the full accumulated chain every time.
 
-```
-schemas/schemas.py       — canonical data contracts used by every module
-onboarding/               — SLM-based rule generation for new formats
-parser_engine/            — format fingerprinting + deterministic parsing
-ingestion/                — raw log storage, traceability, rule validation
-review_ui/                — Streamlit review-gate UI + event browser
-drift_monitor/            — rule health tracking and drift response
-testdata/                 — sample logs, fixtures, integration test runner
-app.py                    — wires every module into the end-to-end pipeline
-docs/                     — module-level documentation
-```
+Ports: web 3000, gateway 8000, Postgres published on host **5433** — 5432 is
+deliberately left to any native Postgres on the dev box (host connections to
+5432 would silently hit that one). Inside the compose network everything still
+uses `postgres:5432`.
 
-## Running it
-
-**One-time setup:**
-```
-pip install ollama streamlit
-ollama pull ibm/granite4.1:3b   # or a larger tag if available
-```
-
-**Run the full pipeline once, to onboard and register rules:**
-```
-python testdata/integration_runner.py
-```
-
-**Launch the review UI (uses the rules the runner just registered):**
-```
-streamlit run review_ui/app.py
-```
-
-Run the integration runner at least once before the UI — the UI reads
-from the same persisted rule store, and falls back to fixture data if
-no real rules are registered yet.
-
-## Module documentation
-
-- [`docs/onboarding.md`](docs/onboarding.md) — SLM rule generation
-- [`docs/parser-engine.md`](docs/parser-engine.md) — fingerprinting + deterministic parsing
-- [`docs/ingestion.md`](docs/ingestion.md) — raw storage + rule validation
-- [`docs/review-ui.md`](docs/review-ui.md) — human review gate + event browser
-- [`docs/drift-monitor.md`](docs/drift-monitor.md) — rule health monitoring
-- [`docs/testing.md`](docs/testing.md) — test data and the integration runner
-
-## Scope notes
-
-Built as a hackathon prototype in a short timeframe. A few deliberate
-scope decisions, documented for transparency rather than hidden:
-
-- **Kafka, Postgres**, and horizontally-scaled deployment are part of
-  the intended production architecture (see the idea presentation) but
-  are not implemented here — SQLite and in-process function calls are
-  sufficient to demonstrate the design at prototype scale.
-- **Drift detection** uses simple threshold-based severity
-  classification, not full statistical process control — documented as
-  the honest scope for this stage.
-- One deliberately difficult, invented vendor format is intentionally
-  left un-auto-onboarded in test data, to demonstrate the manual
-  override path when the model can't fully resolve a format on its own.
+CI (`.github/workflows/ci.yml`): `ruff check .` + `pytest` (libs, services,
+simulator) on Python 3.12; web `npm ci`, vitest, `npm run build` on Node 22.
+The dashboard is React 19.2 + Vite 8.3 + TypeScript 6.

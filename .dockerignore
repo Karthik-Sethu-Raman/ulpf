@@ -1,0 +1,12 @@
+# R12: every service builds with compose build.context: .. — never ship these to the daemon.
+.git
+.claude
+.superpowers
+references
+legacy-demo
+**/__pycache__
+**/*.egg-info
+.venv
+node_modules
+**/node_modules
+.pytest_cache

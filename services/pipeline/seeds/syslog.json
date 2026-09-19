@@ -1,0 +1,11 @@
+{
+  "fingerprint_id": "syslog",
+  "pattern": "^.*?IPTABLES-\\w+:\\s*(?P<extension>.*)$",
+  "mappings": [
+    {"source_field": "SRC", "ocsf_path": "src_endpoint.ip"},
+    {"source_field": "SPT", "ocsf_path": "src_endpoint.port"},
+    {"source_field": "DST", "ocsf_path": "dst_endpoint.ip"},
+    {"source_field": "DPT", "ocsf_path": "dst_endpoint.port"}
+  ],
+  "corpus": "raw_logs_syslog.txt"
+}

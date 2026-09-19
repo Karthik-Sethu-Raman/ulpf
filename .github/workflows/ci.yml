@@ -1,0 +1,43 @@
+# M1 CI (Task 12). Unit tests only — no container services; the live E2E gate
+# is `python scripts/smoke.py`, run locally against the compose stack.
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install libs, services, and test deps
+        run: |
+          pip install -e libs/ulpf-core -e libs/ocsf-schema
+          pip install -r services/collector/requirements.txt \
+                      -r services/pipeline/requirements.txt \
+                      -r services/gateway/requirements.txt \
+                      -r simulator/requirements.txt
+          pip install pytest ruff==0.16.8
+      - name: Lint
+        run: ruff check .
+      - name: Unit tests (libs + services + simulator)
+        run: pytest
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install
+        run: npm ci || npm i
+      - name: Test
+        run: npm run test --if-present
+      - name: Build
+        run: npm run build
