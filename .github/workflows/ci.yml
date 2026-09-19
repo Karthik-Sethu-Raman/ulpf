@@ -17,8 +17,9 @@ jobs:
           pip install -e libs/ulpf-core -e libs/ocsf-schema
           pip install -r services/collector/requirements.txt \
                       -r services/pipeline/requirements.txt \
-                      -r services/gateway/requirements.txt
-          pip install pytest ruff
+                      -r services/gateway/requirements.txt \
+                      -r simulator/requirements.txt
+          pip install pytest ruff==0.16.8
       - name: Lint
         run: ruff check .
       - name: Unit tests (libs + services + simulator)

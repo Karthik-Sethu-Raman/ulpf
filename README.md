@@ -27,9 +27,10 @@ idempotency (Kafka consumer-group delete + pipeline restart: raw events
 unchanged, raw_batches grown), and an independent recomputation of every
 raw_batches merkle root plus full per-partition chain linkage.
 
-Smoke host deps (Python 3.13 tested): `confluent-kafka~=2.6`, `psycopg[binary]`.
-Do NOT install the services' `confluent-kafka==2.5.0` pin host-side — no cp313
-wheels; the images themselves run it fine on Python 3.12. The smoke is
+Smoke host deps (Python 3.13 tested): `psycopg[binary]` only. No confluent-kafka
+on the host: Kafka interaction goes through `docker compose exec redpanda rpk`,
+and the simulator runs in its own container (the services'
+`confluent-kafka==2.5.0` pin is in-image only, py3.12). The smoke is
 delta-based: the database is never reset, so re-runs accumulate and re-verify
 the full accumulated chain every time.
 

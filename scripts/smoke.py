@@ -7,8 +7,10 @@ traceability, forced replay idempotency (consumer-group delete + pipeline
 restart), and independently re-verifies EVERY raw_batches merkle root plus the
 per-partition hash chain linkage.
 
-Host requirements (Python 3.13 tested): confluent-kafka~=2.6, psycopg[binary].
-Everything else is stdlib (urllib for HTTP, subprocess for docker compose).
+Host requirements (Python 3.13 tested): psycopg[binary] only. Everything else
+is stdlib: urllib for HTTP, subprocess for docker compose; all Kafka
+interaction is `docker compose exec redpanda rpk` (no confluent-kafka
+host-side).
 Docker commands run from deploy/; the DB is NOT reset — every count assertion
 is delta-based (snapshot before, diff after), so re-runs accumulate.
 
@@ -43,7 +45,7 @@ GATEWAY = "http://localhost:8000"
 WEB = "http://localhost:3000"
 
 SIM_EPS = "25"
-SIM_DURATION = "20"  # ~500 events: corpora total 57 lines -> several loops
+SIM_DURATION = "20"  # ~500 events: corpora total 56 lines (10+16+15+15) -> several loops
 SEEDED_FPS = ("cef_paloalto", "cef_ciscoasa", "cef_fortigate", "syslog", "json")
 TRACE_SAMPLE = 20
 
@@ -67,9 +69,12 @@ def check(name: str, ok: bool, detail: str) -> bool:
 
 
 def compose(*args: str, timeout: float = 300) -> subprocess.CompletedProcess:
+    # Explicit UTF-8 decoding: the default on Windows is the ANSI codepage
+    # (cp1252 here), and docker output is UTF-8 — a stray byte crashed a
+    # subprocess reader thread with UnicodeDecodeError.
     return subprocess.run(
         ["docker", "compose", *args], cwd=DEPLOY, capture_output=True,
-        text=True, timeout=timeout, check=False,
+        text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False,
     )
 
 
@@ -321,18 +326,22 @@ def assert_d_replay() -> None:
               f"compose stop pipeline failed: {stop.stderr.strip()[:200]}")
         return
     deadline = time.monotonic() + 60
+    saw_members_zero = False
+    last_detail = "group describe never succeeded"
     while time.monotonic() < deadline:  # consumer must be fully out of the group
         out = rpk("group", "describe", "pipeline")
-        if out.returncode != 0 or re.search(r"^MEMBERS\s+0\s*$", out.stdout, re.MULTILINE):
+        if out.returncode == 0 and re.search(r"^MEMBERS\s+0\s*$", out.stdout, re.MULTILINE):
+            saw_members_zero = True
             break
+        last_detail = (out.stderr.strip() or out.stdout.strip())[:120]
         time.sleep(POLL_INTERVAL_S)
-    print("  pipeline stopped; consumer has left the group")
+    if saw_members_zero:
+        print("  pipeline stopped; consumer has left the group")
+    else:
+        print(f"  timeout waiting for members=0, last={last_detail!r} (continuing)")
 
     listing = rpk("group", "list")
-    group_present = listing.returncode == 0 and any(
-        line.split()[-1:] == ["pipeline"]
-        for line in listing.stdout.splitlines() if line.split())
-    if not group_present:
+    if not group_listed(listing):
         check("D replay idempotency", False,
               f"kafka group 'pipeline' absent before delete (replay would be vacuous): "
               f"{listing.stdout.strip()!r}")

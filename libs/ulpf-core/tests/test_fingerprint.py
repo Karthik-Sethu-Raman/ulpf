@@ -60,3 +60,14 @@ def test_hostile_nested_xml_line_is_stable():
     line = "<a>" * 100000
     assert fingerprint_id(line).startswith("auto_")
     assert fingerprint_id(line) == fingerprint_id(line)
+
+def test_hostile_kv_token_cannot_wedge_classify():
+    # Same failure class as the XML probe (R19), one layer down: _classify
+    # recursed once per "=" in a token, so a single token with thousands of
+    # key=value layers raised RecursionError out of shape_hash and wedged the
+    # pipeline batch. Classification must be iterative: no exception, and the
+    # same line always gets the same shape hash / auto_ id.
+    line = "a=" * 1200  # one token: no spaces or [|;,] separators
+    assert shape_hash(line) == shape_hash(line)
+    assert fingerprint_id(line) == fingerprint_id(line)
+    assert fingerprint_id(line).startswith("auto_")

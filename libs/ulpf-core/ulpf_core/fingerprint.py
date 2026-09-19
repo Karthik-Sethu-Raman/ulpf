@@ -158,15 +158,20 @@ _SHAPE_RULES = [
 
 
 def _classify(token: str) -> str:
-    if "=" in token:
-        _, _, value = token.partition("=")
+    # Iterative over nested key=value layers ("a=b=c" -> "KV:KV:<class>"): the
+    # recursive form drove one stack frame per "=" and a hostile single token
+    # with thousands of layers wedged the pipeline batch with RecursionError
+    # (same failure class as _is_xml's RecursionError guard).
+    prefixes: list[str] = []
+    while "=" in token:
         # An empty value ("OUT=", "FLAGS=") classifies like a word value so a
         # field that is present-but-empty hashes the same as one with a value.
-        return f"KV:{_classify(value)}"
+        _, _, token = token.partition("=")
+        prefixes.append("KV:")
     for rx, name in _SHAPE_RULES:
         if rx.match(token):
-            return name
-    return "W"
+            return "".join(prefixes) + name
+    return "".join(prefixes) + "W"
 
 
 def shape_sequence(line: str) -> list[str]:
