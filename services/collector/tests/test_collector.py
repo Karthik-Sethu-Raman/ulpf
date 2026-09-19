@@ -1,6 +1,8 @@
 # services/collector/tests/test_collector.py — collector unit tests (fake producer, no Kafka).
 import pytest
-from collector.app import build_app   # FastAPI app factory; producer injected
+
+from collector.app import build_app  # FastAPI app factory; producer injected
+
 
 class FakeProducer:
     def __init__(self): self.produced = []
@@ -23,7 +25,7 @@ def test_http_ingest_builds_envelopes(client):
     assert env["received_at"]  # ISO8601 present
 
 def test_http_rejects_oversized_line(client):
-    c, prod = client
+    c, _prod = client
     r = c.post("/v1/ingest", json={"source_id": "x", "lines": ["y" * 70000]})
     assert r.status_code == 422
 

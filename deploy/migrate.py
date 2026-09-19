@@ -37,29 +37,28 @@ def main() -> int:
 
     # autocommit=True so each conn.transaction() below is a real top-level
     # transaction that commits per file, independently of later files.
-    with psycopg.connect(admin_url, autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "CREATE TABLE IF NOT EXISTS schema_migrations ("
-                "name TEXT PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"
-            )
-            cur.execute("SELECT name FROM schema_migrations")
-            applied = {row[0] for row in cur.fetchall()}
+    with psycopg.connect(admin_url, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "name TEXT PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"
+        )
+        cur.execute("SELECT name FROM schema_migrations")
+        applied = {row[0] for row in cur.fetchall()}
 
-            pending = [f for f in files if f.name not in applied]
-            if not pending:
-                print("migrations: up to date")
-                return 0
+        pending = [f for f in files if f.name not in applied]
+        if not pending:
+            print("migrations: up to date")
+            return 0
 
-            for path in pending:
-                print(f"applying {path.name}")
-                with conn.transaction():
-                    cur.execute(path.read_text(encoding="utf-8"))
-                    cur.execute(
-                        "INSERT INTO schema_migrations (name) VALUES (%s)",
-                        (path.name,),
-                    )
-                print(f"applied  {path.name}")
+        for path in pending:
+            print(f"applying {path.name}")
+            with conn.transaction():
+                cur.execute(path.read_text(encoding="utf-8"))
+                cur.execute(
+                    "INSERT INTO schema_migrations (name) VALUES (%s)",
+                    (path.name,),
+                )
+            print(f"applied  {path.name}")
     return 0
 
 

@@ -74,11 +74,18 @@ def _first_element_end(text: str) -> int | None:
 
 
 def _is_xml(text: str) -> bool:
-    """XML heuristic: parses as XML, or its truncated first element does."""
+    """XML heuristic: parses as XML, or its truncated first element does.
+
+    RecursionError is caught alongside ParseError: a deeply-nested hostile
+    line can exhaust the parser's recursion before it yields a ParseError
+    (recursion-limited ElementTree builds), and an escaped RecursionError
+    would wedge the consuming pipeline batch in a redelivery loop. Either
+    failure classifies as "not xml" and falls through to the shape hash.
+    """
     try:
         ET.fromstring(text)
         return True
-    except ET.ParseError:
+    except (ET.ParseError, RecursionError):
         pass
     end = _first_element_end(text)
     if end is None:
@@ -86,7 +93,7 @@ def _is_xml(text: str) -> bool:
     try:
         ET.fromstring(text[:end])
         return True
-    except ET.ParseError:
+    except (ET.ParseError, RecursionError):
         return False
 
 
@@ -152,7 +159,7 @@ _SHAPE_RULES = [
 
 def _classify(token: str) -> str:
     if "=" in token:
-        key, _, value = token.partition("=")
+        _, _, value = token.partition("=")
         # An empty value ("OUT=", "FLAGS=") classifies like a word value so a
         # field that is present-but-empty hashes the same as one with a value.
         return f"KV:{_classify(value)}"

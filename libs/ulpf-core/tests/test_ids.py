@@ -1,5 +1,7 @@
 import uuid
-from ulpf_core.ids import raw_id_for, event_id_for
+
+from ulpf_core.ids import event_id_for, raw_id_for
+
 
 def test_raw_id_deterministic():
     assert raw_id_for("raw.logs", 3, 9182) == raw_id_for("raw.logs", 3, 9182)

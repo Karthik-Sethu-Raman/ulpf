@@ -114,7 +114,7 @@ class HttpSender:
             return 0
         try:
             return int(resp.json().get("accepted", len(lines)))
-        except Exception:
+        except Exception:  # noqa: BLE001 - any 202-body failure still trusts the transport
             return len(lines)  # 202 but unparseable body: trust the transport
 
     async def close(self) -> None:
@@ -199,7 +199,7 @@ async def run(corpora: list[Corpus], *, eps: float, duration: float,
             cursors[i] += 1
             try:
                 sent[corpus.name] += await corpus.sender.send(line)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - one failed send counts and moves on
                 errors += 1
                 print(f"error: {corpus.name}: {exc}", file=sys.stderr)
         pass_no += 1
@@ -211,7 +211,7 @@ async def run(corpora: list[Corpus], *, eps: float, duration: float,
     for corpus in corpora:
         try:
             sent[corpus.name] += await corpus.sender.flush()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed flush counts and moves on
             errors += 1
             print(f"error: {corpus.name} flush: {exc}", file=sys.stderr)
     return sent, errors

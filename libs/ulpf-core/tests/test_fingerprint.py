@@ -1,6 +1,7 @@
 # libs/ulpf-core/tests/test_fingerprint.py
 import re
 from pathlib import Path
+
 from ulpf_core.fingerprint import fingerprint_id, shape_hash
 
 GOLDEN = Path(__file__).parent / "data" / "golden"
@@ -38,3 +39,24 @@ def test_mutated_hostnames_and_numbers_stable():
 def test_csv_and_xml_detected():
     assert fingerprint_id("a,b,c,1,2,3") == "csv"
     assert fingerprint_id("<event><src>1.2.3.4</src></event>") == "xml"
+
+def test_deeply_nested_xml_cannot_wedge_fingerprint(monkeypatch):
+    # R19 regression: on recursion-limited ElementTree builds the probe over a
+    # deeply-nested hostile line raises RecursionError instead of ParseError.
+    # RecursionError is not a ParseError, so an uncaught one escapes
+    # fingerprint_id and wedges the pipeline batch (redelivery loop). It must
+    # classify as "not xml" and fall through to the shape-hash path.
+    import xml.etree.ElementTree as ET
+
+    def recurse_forever(text):
+        raise RecursionError("maximum recursion depth exceeded while parsing")
+
+    monkeypatch.setattr(ET, "fromstring", recurse_forever)
+    assert re.fullmatch(r"auto_[0-9a-f]{8}", fingerprint_id("<a>" * 100000))
+
+def test_hostile_nested_xml_line_is_stable():
+    # The literal hostile input: never raises, and the same line always gets
+    # the same auto_ id (the truncation probe stays intact).
+    line = "<a>" * 100000
+    assert fingerprint_id(line).startswith("auto_")
+    assert fingerprint_id(line) == fingerprint_id(line)

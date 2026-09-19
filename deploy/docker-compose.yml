@@ -4,7 +4,10 @@ services:
   postgres:
     image: postgres:16
     environment: { POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: ulpf }
-    ports: ["5432:5432"]
+    # Host port 5433, NOT 5432: dev boxes with a native Postgres service own
+    # 5432, and host connections would silently hit that one instead. Only the
+    # published port changes; the compose network keeps postgres:5432.
+    ports: ["5433:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck: { test: ["CMD-SHELL", "pg_isready -U postgres -d ulpf"], interval: 3s, retries: 20 }
   migrate:

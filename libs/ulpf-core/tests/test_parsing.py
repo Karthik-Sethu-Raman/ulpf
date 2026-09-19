@@ -1,8 +1,8 @@
 # libs/ulpf-core/tests/test_parsing.py — key cases, all with concrete data:
 import sys
 
-from ulpf_core.parsing import parse, validate_rule_output, OCSF_TARGETS
-from ulpf_core.models import Rule, Mapping
+from ulpf_core.models import Mapping, Rule
+from ulpf_core.parsing import OCSF_TARGETS, parse, validate_rule_output
 
 CEF_RULE = Rule(fingerprint_id="cef_paloalto", version=1,
     pattern=r"^.*\|(?P<extension>.*)$",

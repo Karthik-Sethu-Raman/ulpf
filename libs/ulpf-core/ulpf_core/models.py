@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
 
+
 class RawEnvelope(BaseModel):
     source_id: str
     transport: str                      # "syslog-udp" | "syslog-tcp" | "http"

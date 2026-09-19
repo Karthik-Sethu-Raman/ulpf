@@ -7,14 +7,14 @@ import asyncio
 import contextlib
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ValidationError
+from ulpf_core.models import RawEnvelope
 
 from collector.producer import KafkaProducer
-from ulpf_core.models import RawEnvelope
 
 log = logging.getLogger("collector")
 
@@ -28,7 +28,7 @@ def make_envelope(transport: str, source_id: str, raw: str) -> dict:
     return {
         "transport": transport,
         "source_id": source_id,
-        "received_at": datetime.now(timezone.utc).isoformat(),
+        "received_at": datetime.now(UTC).isoformat(),
         "raw": raw,
     }
 
