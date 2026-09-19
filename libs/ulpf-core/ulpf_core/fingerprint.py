@@ -124,7 +124,10 @@ def _known_format(line: str) -> str | None:
         try:
             json.loads(text)
             return "json"
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
+            # RecursionError, like _is_xml's guard (R19): the json decoder
+            # raises it — not JSONDecodeError — for deeply-nested hostile
+            # text, and an escaped one would wedge the pipeline batch.
             pass
 
     # 4. Syslog Format

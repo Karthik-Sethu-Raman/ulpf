@@ -40,6 +40,9 @@ services:
     environment: { KAFKA_BOOTSTRAP: redpanda:9092 }
     ports: ["5514:5514/udp", "5514:5514", "8080:8080"]
     depends_on: { topics: { condition: service_completed_successfully } }
+  # M1: exactly ONE pipeline replica — batch_seq = MAX+1 per partition is only
+  # safe with a single consumer per partition (spec §4). Scale-out needs zombie
+  # fencing and epoch-based batch_seq before it is correctness-safe (M3).
   pipeline:
     build: { context: .., dockerfile: services/pipeline/Dockerfile }
     environment:

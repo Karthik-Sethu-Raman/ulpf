@@ -71,3 +71,13 @@ def test_hostile_kv_token_cannot_wedge_classify():
     assert shape_hash(line) == shape_hash(line)
     assert fingerprint_id(line) == fingerprint_id(line)
     assert fingerprint_id(line).startswith("auto_")
+
+def test_deeply_nested_json_cannot_wedge_fingerprint():
+    # Same failure class again (final-review critical): json.loads raises
+    # RecursionError — not JSONDecodeError — for deeply-nested hostile text,
+    # and the 65,536-char line cap does not bound nesting depth. This exact
+    # line is 17,995 chars, so it reaches fingerprint_id via UDP/HTTP ingest.
+    line = '{"a":' * 3000 + "1" + "}" * 3000
+    fp = fingerprint_id(line)
+    assert re.fullmatch(r"auto_[0-9a-f]{8}", fp)
+    assert fp == fingerprint_id(line)

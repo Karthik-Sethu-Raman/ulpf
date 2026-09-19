@@ -8,8 +8,11 @@
 #      + pipeline.dlq; parsed docs -> normalized.events (key=fingerprint_id)
 #   5. persist_normalized — COMMITTED
 #   6. only then consumer.commit()
-# Crash anywhere before step 6 and the batch is redelivered; every write is
-# deterministic and ON CONFLICT-guarded, so redelivery is a no-op (spec §4).
+# Crash/rollback anywhere before step 6 and the worker seeks each affected
+# partition back to the failed batch's first offset (consume() had already
+# advanced the position; the next no-arg commit() would otherwise cover the
+# failed batch and its events would be silently lost). Redelivery is a no-op
+# on the DB side: every write is deterministic and ON CONFLICT-guarded (§4).
 #
 # parsed_at is the raw event's received_at (not wall clock) so a replay mints
 # the same event_id and collides instead of duplicating. M1 never supersedes
@@ -62,6 +65,16 @@ class KafkaConsumer:
     def consume(self, num_messages: int, timeout: float) -> list:
         return self._consumer.consume(num_messages=num_messages, timeout=timeout)
 
+    def seek(self, partition_offsets: dict[int, int]) -> None:
+        """Seek each partition back to *offset* (failed-batch redelivery).
+
+        confluent_kafka keeps the import deferred here, like __init__."""
+        import confluent_kafka
+
+        for partition, offset in sorted(partition_offsets.items()):
+            self._consumer.seek(
+                confluent_kafka.TopicPartition(TOPIC_RAW, partition, offset))
+
     def commit(self) -> None:
         self._consumer.commit()
 
@@ -99,6 +112,28 @@ class PipelineWorker:
         self.canary_failures = 0  # spec §6.4: canary failures logged + counted
         self._parsed_total = 0
 
+    def _seek_back(self, msgs) -> None:
+        """Seek every partition in *msgs* back to its first failed-batch offset.
+
+        consume() advances the consumer position past a batch regardless of
+        processing success, and no-arg commit() commits that position — so a
+        failed batch whose offsets were merely 'not committed' would be
+        silently covered by the next successful batch's commit. Seeking back
+        makes the failed batch the next thing consumed (at-least-once, §4).
+        """
+        first: dict[int, int] = {}
+        for msg in msgs:
+            partition, offset = msg.partition(), msg.offset()
+            if partition not in first or offset < first[partition]:
+                first[partition] = offset
+        try:
+            self.consumer.seek(first)
+        except Exception:
+            # Never let a seek failure kill the loop; the next failed batch
+            # re-attempts the seek, and rebalances reset positions to the
+            # (clean) committed offsets anyway.
+            log.exception("seek-back failed; offsets NOT committed; will re-seek on next failure")
+
     def run(self) -> None:
         self.consumer.subscribe(TOPIC_RAW)
         log.info("pipeline consuming %s as group %r", TOPIC_RAW, GROUP_ID)
@@ -112,12 +147,15 @@ class PipelineWorker:
                 data.append(msg)
             if data:
                 # The WHOLE iteration is guarded (R16): a transient DB/Kafka
-                # drop anywhere in the batch must degrade to retry-next-batch
-                # (offsets stay uncommitted -> redelivery), not process death.
+                # drop anywhere in the batch must degrade to redelivery of
+                # THAT batch (seek back + offsets stay uncommitted), not
+                # process death and not silent position advance.
                 try:
                     self.process_batch(data)
                 except Exception:
-                    log.exception("batch failed; offsets NOT committed; batch redelivered")
+                    self._seek_back(data)
+                    log.exception("batch failed; seeked back to first failed offsets; "
+                                  "offsets NOT committed; batch redelivered")
 
     def process_batch(self, msgs) -> bool:
         """One full batch; returns True iff offsets were committed.
@@ -132,7 +170,9 @@ class PipelineWorker:
             persist_batch(self.conn, rows, partitions)
         except Exception:
             self.conn.rollback()
-            log.exception("raw persist failed; offsets NOT committed; batch redelivered")
+            self._seek_back(msgs)  # redeliver THIS batch, not just hope for it
+            log.exception("raw persist failed; seeked back to first failed offsets; "
+                          "offsets NOT committed; batch redelivered")
             return False
 
         rules = load_active_rules(self.conn)  # refreshed every batch
@@ -203,10 +243,16 @@ class PipelineWorker:
             persist_normalized(self.conn, events)
         except Exception:
             self.conn.rollback()
-            log.exception("normalized persist failed; offsets NOT committed; batch redelivered")
+            self._seek_back(msgs)  # redeliver THIS batch (raw rows ON CONFLICT dedup)
+            log.exception("normalized persist failed; seeked back to first failed offsets; "
+                          "offsets NOT committed; batch redelivered")
             return False
 
-        self.consumer.commit()  # both DB txns durable -> safe to advance offsets
+        # Both DB txns durable -> safe to advance. commit() (no args) commits
+        # the consumer POSITION, which already covers every consumed batch —
+        # any batch that failed earlier must have seeked back above, or this
+        # commit would silently cover it.
+        self.consumer.commit()
         log.info("batch: %d consumed, %d parsed, %d unparsed, %d parse_error, "
                  "%d skipped-envelope, canary_failures=%d",
                  len(msgs), parsed, unparsed, parse_errors, len(msgs) - len(rows),

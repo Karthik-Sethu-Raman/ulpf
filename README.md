@@ -18,6 +18,9 @@ exit is `python scripts/smoke.py` (all 5 checks PASS).
 cd deploy && docker compose --profile sim up -d --build
 python scripts/smoke.py          # end-to-end acceptance incl. forced replay
 open http://localhost:3000       # Overview: live feed + raw traceability
+# sustained live traffic for the dashboard (the --profile sim one-shot above
+# exits after its single ~56-line pass):
+docker compose run --rm simulator --eps 20 --duration 300 --loop
 ```
 
 The smoke runs the simulator over the golden corpora, then verifies: lossless
