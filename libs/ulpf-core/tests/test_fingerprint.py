@@ -75,9 +75,13 @@ def test_hostile_kv_token_cannot_wedge_classify():
 def test_deeply_nested_json_cannot_wedge_fingerprint():
     # Same failure class again (final-review critical): json.loads raises
     # RecursionError — not JSONDecodeError — for deeply-nested hostile text,
-    # and the 65,536-char line cap does not bound nesting depth. This exact
-    # line is 17,995 chars, so it reaches fingerprint_id via UDP/HTTP ingest.
-    line = '{"a":' * 3000 + "1" + "}" * 3000
+    # and the 65,536-char line cap does not bound nesting depth. The depth
+    # must trip the recursion limit on BOTH interpreter generations: CPython
+    # 3.12's C json scanner parses depth-3000 without error (CI runs 3.12),
+    # while 3.13 already raises there. Depth 10,000 raises on both and the
+    # line is 60,001 chars — under the cap, so it reaches fingerprint_id
+    # via UDP/HTTP ingest.
+    line = '{"a":' * 10000 + "1" + "}" * 10000
     fp = fingerprint_id(line)
     assert re.fullmatch(r"auto_[0-9a-f]{8}", fp)
     assert fp == fingerprint_id(line)

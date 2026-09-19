@@ -117,10 +117,11 @@ def test_poison_received_at_skipped_not_fatal():
 def test_hostile_nested_json_line_becomes_a_row_not_a_crash():
     # Final-review critical at the batch layer: fingerprint_id is called
     # OUTSIDE build_rows' envelope guard, so a RecursionError escaping the
-    # JSON probe used to blow up the whole batch. The hostile line (17,995
-    # chars — under the 65,536 cap, so it passes envelope validation) must
+    # JSON probe used to blow up the whole batch. Depth 10,000 (60,001 chars
+    # — under the 65,536 cap, so it passes envelope validation, and deep
+    # enough to raise RecursionError on CPython 3.12 and 3.13 alike) must
     # yield an ordinary fingerprinted raw row, not an exception.
-    raw = '{"a":' * 3000 + "1" + "}" * 3000
+    raw = '{"a":' * 10000 + "1" + "}" * 10000
     rows, parts = build_rows([FakeMsg(0, 9, envelope(raw=raw))])
     assert len(rows) == 1
     assert rows[0].fingerprint_id.startswith("auto_")
