@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ocsf-schema"
+version = "0.1.0"
+description = "ULPF curated OCSF subset schema (Network Activity) + activation-time validator"
+requires-python = ">=3.12"
+
+[project.optional-dependencies]
+# jsonschema is only needed at rule activation / canary (spec §6.4), never per event.
+activation = ["jsonschema~=4.23"]
+
+[tool.setuptools]
+packages = ["ocsf_schema"]
+
+[tool.setuptools.package-data]
+ocsf_schema = ["schema.json"]

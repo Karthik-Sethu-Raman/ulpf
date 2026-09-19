@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ULPF Network Activity (curated OCSF subset)",
+  "description": "Curated subset of the OCSF Network Activity class (spec §6.4). Validated at rule activation and by the runtime canary only — never per event.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["class_uid", "activity_id", "time", "metadata", "unmapped"],
+  "properties": {
+    "class_uid": {"const": 4001},
+    "class_name": {"const": "Network Activity"},
+    "activity_id": {"type": "integer", "minimum": 0, "maximum": 99},
+    "severity_id": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
+    "time": {"type": ["string", "null"], "description": "Event time; null when the rule mapped no timestamp — the pipeline fills ingestion time before emission."},
+    "action": {"type": ["string", "null"]},
+    "message": {"type": ["string", "null"]},
+    "src_endpoint": {
+      "type": ["object", "null"],
+      "properties": {
+        "ip": {"type": "string"},
+        "port": {"type": ["integer", "string"]}
+      }
+    },
+    "dst_endpoint": {
+      "type": ["object", "null"],
+      "properties": {
+        "ip": {"type": "string"},
+        "port": {"type": ["integer", "string"]}
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "product": {"const": "ULPF"}
+      },
+      "required": ["product"]
+    },
+    "unmapped": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "OCSF standard unmapped object — captured fields with no OCSF home are never dropped (spec §6.4)."
+    }
+  }
+}
