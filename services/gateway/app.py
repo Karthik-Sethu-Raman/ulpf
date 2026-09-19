@@ -30,8 +30,11 @@ SSE_HEARTBEAT_SECONDS = 15.0
 
 
 def _json_default(value):
-    """SSE bodies are hand-serialized: datetimes must come out ISO-8601 (with
-    the T separator), which str(datetime) would not guarantee."""
+    """SSE bodies are hand-serialized: dict_row rows carry uuid.UUID for UUID
+    columns (psycopg3's default UUID loader) and datetime for timestamptz —
+    both must become JSON scalars (str / ISO-8601 with the T separator)."""
+    if isinstance(value, uuid.UUID):
+        return str(value)
     if isinstance(value, datetime):
         return value.isoformat()
     raise TypeError(f"unserializable SSE value: {type(value).__name__}")

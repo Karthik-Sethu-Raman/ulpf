@@ -38,10 +38,11 @@ def clamp_limit(limit: int) -> int:
 
 
 def zero_fill_statuses(rows) -> dict[str, int]:
-    """by_status GROUP BY rows -> contract dict with all four keys, zero-filled."""
+    """by_status GROUP BY rows (dict_row dicts: {"status": ..., "n": ...}) ->
+    contract dict with all four keys, zero-filled."""
     out = {status: 0 for status in _STATUS_KEYS}
-    for status, count in rows:
-        out[status] = count
+    for row in rows:
+        out[row["status"]] = row["n"]
     return out
 
 
@@ -60,7 +61,8 @@ def fetch_stats() -> dict:
             "SELECT fingerprint_id, count(*) AS total, "
             "count(*) FILTER (WHERE status = 'parsed') AS parsed "
             "FROM normalized_events WHERE superseded_by_event_id IS NULL "
-            "GROUP BY fingerprint_id ORDER BY total DESC, fingerprint_id"
+            "GROUP BY fingerprint_id ORDER BY total DESC, fingerprint_id "
+            "LIMIT 500"  # controller R20: hard cap — unbounded once M2 onboarding mints fingerprints
         )
         by_fingerprint = cur.fetchall()
         cur.execute(
