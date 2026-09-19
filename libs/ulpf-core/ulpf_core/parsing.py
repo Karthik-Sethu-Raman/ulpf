@@ -3,9 +3,10 @@
 Ported from legacy-demo/parser_engine/apply_rule.py (the proven demo logic)
 with the spec fixes M1 requires:
 
-- rule-supplied regex runs through the ``regex`` module under a per-match
-  timeout (spec §10) — timeout / compile error / no match are returned as
-  errors, never a hot-path hang or raise;
+- rule-supplied regex and the extension key=value scan (both untrusted line
+  text) run through the ``regex`` module under a per-match ms timeout
+  (spec §10) — timeout / compile error / no match are returned as errors,
+  never a hot-path hang or raise;
 - mapping targets are allow-listed (``OCSF_TARGETS``) at document build —
   defense-in-depth behind activation-time validation, so a rule can never
   write outside the curated subset;
@@ -129,7 +130,12 @@ def _parse_regex(line: str, rule: Rule, timeout_ms: int) -> tuple[dict | None, s
     all_fields: dict[str, Any] = dict(match.groupdict())
     extension_text = all_fields.get("extension")
     if extension_text:
-        all_fields.update(_parse_extension_kv(extension_text))
+        try:
+            all_fields.update(_parse_extension_kv(extension_text, timeout_ms))
+        except TimeoutError:
+            # The rule-pattern timeout above does not cover the KV scan; the
+            # extension blob is untrusted line text too (spec §10).
+            return None, "timeout"
 
     parts = _new_parts()
     mapped: set[str] = set()
@@ -143,12 +149,17 @@ def _parse_regex(line: str, rule: Rule, timeout_ms: int) -> tuple[dict | None, s
     return _build_document(parts, _unmapped_regex(all_fields, mapped)), None
 
 
-def _parse_extension_kv(extension_str: str) -> dict[str, str]:
-    """Parse key=value pairs from extension text (e.g. src=1.2.3.4 msg=Suspicious DNS Query)."""
+def _parse_extension_kv(extension_str: str, timeout_ms: int) -> dict[str, str]:
+    """Parse key=value pairs from extension text (e.g. src=1.2.3.4 msg=Suspicious DNS Query).
+
+    The extension blob is untrusted line text, so the scan runs under the same
+    ms-scale timeout as the rule pattern (spec §10) — quadratic backtracking
+    on a crafted blob becomes a TimeoutError, not a hot-path stall.
+    """
     pairs: dict[str, str] = {}
     if not extension_str:
         return pairs
-    for match in EXTENSION_KV.finditer(extension_str):
+    for match in EXTENSION_KV.finditer(extension_str, timeout=timeout_ms / 1000.0):
         key = match.group(1)
         value = match.group(2) if match.group(2) is not None else match.group(3)
         pairs[key] = value.strip()
@@ -240,12 +251,14 @@ def _set_path(parts: dict[str, Any], ocsf_path: str, value: Any) -> None:
 
 
 def _as_int(value: Any, *, keep: bool) -> Any:
-    """int cast with the hot-path fix: a bad value keeps the string (ports)
-    or becomes None (severity) instead of crashing the parse."""
+    """int cast with the hot-path fix: a non-castable value keeps the original
+    string (ports) or becomes None (severity) instead of crashing the parse.
+    Non-string values (dict/list from JSON) become None either way — only a
+    string is worth preserving verbatim."""
     try:
         return int(value)
     except (TypeError, ValueError):
-        return value if keep else None
+        return value if (keep and isinstance(value, str)) else None
 
 
 def _unmapped_regex(all_fields: dict[str, Any], mapped: set[str]) -> dict[str, Any]:
@@ -311,12 +324,14 @@ def _pattern_cap_errors(pattern: str) -> list[str]:
 
 
 def _document_errors(doc: dict) -> list[str]:
-    """ocsf_schema.validator.validate_document, or [] when ocsf-schema is not
-    installed. The two libs are always installed together in practice (CI, dev
-    setup); the fallback mirrors the validator's own jsonschema-optional
-    contract and keeps ulpf-core importable standalone."""
+    """ocsf_schema.validator.validate_document; FAILS CLOSED when ocsf-schema
+    is not installed — a missing validator is an activation error, never a
+    silent pass (the activation gate must not approve rules it could not
+    check). ulpf-core keeps no hard dependency on ocsf-schema (the plan
+    installs the two libs side by side); the validator's own jsonschema
+    fallback inside ocsf_schema is separate and runtime-canary-scoped."""
     try:
         from ocsf_schema.validator import validate_document
-    except ImportError:
-        return []
+    except ImportError as exc:
+        return [f"schema validator unavailable: {exc}"]
     return validate_document(doc)

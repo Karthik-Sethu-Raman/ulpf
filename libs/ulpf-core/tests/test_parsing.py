@@ -1,4 +1,6 @@
 # libs/ulpf-core/tests/test_parsing.py — key cases, all with concrete data:
+import sys
+
 from ulpf_core.parsing import parse, validate_rule_output, OCSF_TARGETS
 from ulpf_core.models import Rule, Mapping
 
@@ -80,3 +82,35 @@ def test_activation_validation_passes_for_golden_cef():
     from pathlib import Path
     lines = (Path(__file__).parent / "data/golden/raw_logs_cef.txt").read_text().splitlines()
     assert validate_rule_output(CEF_RULE, lines) == []
+
+def test_ocsf_targets_contract():
+    assert OCSF_TARGETS == frozenset({"src_endpoint.ip","src_endpoint.port","dst_endpoint.ip","dst_endpoint.port","time","severity_id","action","message"})
+
+def test_non_string_bad_port_becomes_none():            # keep only strings (spec §6.4 fix)
+    import json as _json
+    line = _json.dumps({"src_ip": "203.0.113.45", "src_port": {"oops": 1}})
+    doc, err = parse(line, JSON_RULE)
+    assert err is None and doc is not None
+    assert doc["src_endpoint"] == {"ip": "203.0.113.45", "port": None}
+
+def test_extension_kv_scan_timeout_is_error():          # spec §10: untrusted blob too
+    # An 'a'-wall ending in '=' sends the extension KV regex into quadratic
+    # backtracking; at 32KB it used to stall parse() ~3s at the DEFAULT
+    # 50ms timeout because only the rule-pattern search was covered.
+    import time
+    evil_line = "CEF:0|v|p|1|s|n|5|" + "a" * 32000 + "="
+    t0 = time.perf_counter()
+    doc, err = parse(evil_line, CEF_RULE)
+    elapsed = time.perf_counter() - t0
+    assert doc is None and "timeout" in err
+    assert elapsed < 1.0
+
+def test_activation_fails_closed_without_schema_validator(monkeypatch):
+    # Ruling: activation validation fails CLOSED — a missing ocsf-schema is an
+    # error, never a silent pass (the jsonschema fallback inside the validator
+    # itself is separate and runtime-canary-scoped). Poison both cache keys so
+    # the from-import hits ImportError even when earlier tests imported it.
+    monkeypatch.setitem(sys.modules, "ocsf_schema", None)
+    monkeypatch.setitem(sys.modules, "ocsf_schema.validator", None)
+    errs = validate_rule_output(CEF_RULE, [CEF_LINE])
+    assert errs and any("schema validator unavailable" in e for e in errs)
