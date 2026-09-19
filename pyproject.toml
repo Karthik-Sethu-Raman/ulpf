@@ -1,6 +1,6 @@
 [tool.pytest.ini_options]
 testpaths = ["libs", "services"]
-pythonpath = [".", "services/collector"]
+pythonpath = [".", "services/collector", "services/pipeline"]
 
 [tool.ruff]
 line-length = 100
