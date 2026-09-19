@@ -1,0 +1,13 @@
+{
+  "fingerprint_id": "cef_fortigate",
+  "pattern": "^.*\\|(?P<extension>.*)$",
+  "mappings": [
+    {"source_field": "src", "ocsf_path": "src_endpoint.ip"},
+    {"source_field": "spt", "ocsf_path": "src_endpoint.port"},
+    {"source_field": "dst", "ocsf_path": "dst_endpoint.ip"},
+    {"source_field": "dpt", "ocsf_path": "dst_endpoint.port"},
+    {"source_field": "act", "ocsf_path": "action"},
+    {"source_field": "msg", "ocsf_path": "message"}
+  ],
+  "corpus": "raw_logs_cef.txt"
+}

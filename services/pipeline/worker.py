@@ -111,7 +111,13 @@ class PipelineWorker:
                     continue
                 data.append(msg)
             if data:
-                self.process_batch(data)
+                # The WHOLE iteration is guarded (R16): a transient DB/Kafka
+                # drop anywhere in the batch must degrade to retry-next-batch
+                # (offsets stay uncommitted -> redelivery), not process death.
+                try:
+                    self.process_batch(data)
+                except Exception:
+                    log.exception("batch failed; offsets NOT committed; batch redelivered")
 
     def process_batch(self, msgs) -> bool:
         """One full batch; returns True iff offsets were committed.

@@ -11,6 +11,14 @@ services:
     build: { context: .., dockerfile: deploy/migrate.Dockerfile }
     environment: { ADMIN_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ulpf }
     depends_on: { postgres: { condition: service_healthy } }
+  seed:
+    build: { context: .., dockerfile: deploy/seed.Dockerfile }
+    # pipeline_role is SELECT-only on rules — seeding runs as the admin,
+    # after migrations (controller R18). Validated at load: a broken seed
+    # exits 1 and loads nothing; a re-run is a no-op (ON CONFLICT).
+    environment: { ADMIN_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ulpf }
+    restart: "no"
+    depends_on: { migrate: { condition: service_completed_successfully } }
   redpanda:
     image: redpandadata/redpanda:v24.1.7
     command: [ redpanda, start, --overprovisioned, --smp, "1", --memory, 1G,
@@ -34,7 +42,8 @@ services:
     environment:
       KAFKA_BOOTSTRAP: redpanda:9092
       DATABASE_URL: postgresql://pipeline_role:pipeline_dev@postgres:5432/ulpf
-    depends_on: { migrate: { condition: service_completed_successfully }, topics: { condition: service_completed_successfully } }
+    restart: unless-stopped
+    depends_on: { migrate: { condition: service_completed_successfully }, topics: { condition: service_completed_successfully }, seed: { condition: service_completed_successfully } }
   gateway:
     build: { context: .., dockerfile: services/gateway/Dockerfile }
     environment:

@@ -100,3 +100,15 @@ def test_oversized_line_skipped():
     big = FakeMsg(0, 5, envelope(raw="x" * 70000))
     rows, parts = build_rows([big])
     assert rows == [] and parts == {}
+
+
+def test_poison_received_at_skipped_not_fatal():
+    # R16a: the received_at timestamp parse sits inside the envelope guard —
+    # a well-formed envelope carrying a malformed timestamp is just another
+    # poison record to skip, never a worker-killing exception.
+    bad = FakeMsg(0, 1, envelope(received_at="not-a-timestamp"))
+    good = FakeMsg(0, 2, envelope())
+    rows, parts = build_rows([bad, good])
+    assert len(rows) == 1
+    assert rows[0].raw_id == raw_id_for(TOPIC, 0, 2)
+    assert parts[0].first_offset == 2

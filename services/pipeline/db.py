@@ -97,6 +97,10 @@ def build_rows(msgs) -> tuple[list[RawRow], dict[int, PartitionMeta]]:
         topic, partition, offset = msg.topic(), msg.partition(), msg.offset()
         try:
             env = RawEnvelope(**json.loads(msg.value()))
+            # The timestamp parse stays inside this guard (R16): a well-formed
+            # envelope with a malformed received_at is a poison record to skip,
+            # not a worker-killing exception.
+            received_at = datetime.fromisoformat(env.received_at)
         except (ValueError, TypeError) as exc:
             log.warning("skipping %s[%d@%d]: undecodable/invalid envelope: %s",
                         topic, partition, offset, exc)
@@ -108,7 +112,7 @@ def build_rows(msgs) -> tuple[list[RawRow], dict[int, PartitionMeta]]:
         meta.last_offset = offset
         row = RawRow(
             raw_id=raw_id_for(topic, partition, offset),
-            received_at=datetime.fromisoformat(env.received_at),
+            received_at=received_at,
             source_id=env.source_id,
             transport=env.transport,
             format_hint=env.format_hint,
