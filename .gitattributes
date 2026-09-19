@@ -1,0 +1,3 @@
+# Shell scripts run inside Linux containers (e.g. deploy/redpanda-init.sh is
+# bind-mounted into the redpanda image) — they must stay LF on every platform.
+*.sh text eol=lf

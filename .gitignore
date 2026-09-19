@@ -22,6 +22,7 @@ ENV/
 
 # Env / secrets
 .env
+deploy/.env
 *.env.local
 
 # OS / editor cruft

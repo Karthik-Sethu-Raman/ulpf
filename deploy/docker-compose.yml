@@ -1,0 +1,53 @@
+# deploy/docker-compose.yml — M1 profile. Ollama/onboarding join in M2.
+name: ulpf
+services:
+  postgres:
+    image: postgres:16
+    environment: { POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: ulpf }
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U postgres -d ulpf"], interval: 3s, retries: 20 }
+  migrate:
+    build: { context: .., dockerfile: deploy/migrate.Dockerfile }
+    environment: { ADMIN_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ulpf }
+    depends_on: { postgres: { condition: service_healthy } }
+  redpanda:
+    image: redpandadata/redpanda:v24.1.7
+    command: [ redpanda, start, --overprovisioned, --smp, "1", --memory, 1G,
+               --kafka-addr, "PLAINTEXT://0.0.0.0:9092", --advertise-kafka-addr, "PLAINTEXT://redpanda:9092" ]
+    ports: ["9092:9092"]
+    healthcheck: { test: ["CMD", "rpk", "cluster", "info"], interval: 5s, retries: 20 }
+  topics:
+    image: redpandadata/redpanda:v24.1.7
+    depends_on: { redpanda: { condition: service_healthy } }
+    # rpk defaults to 127.0.0.1:9092, which is not the broker from this container.
+    environment: { RPK_BROKERS: redpanda:9092 }
+    entrypoint: [ "/bin/sh", "-c", "/init.sh" ]
+    volumes: [ ./redpanda-init.sh:/init.sh ]
+  collector:
+    build: { context: .., dockerfile: services/collector/Dockerfile }
+    environment: { KAFKA_BOOTSTRAP: redpanda:9092 }
+    ports: ["5514:5514/udp", "5514:5514", "8080:8080"]
+    depends_on: { topics: { condition: service_completed_successfully } }
+  pipeline:
+    build: { context: .., dockerfile: services/pipeline/Dockerfile }
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092
+      DATABASE_URL: postgresql://pipeline_role:pipeline_dev@postgres:5432/ulpf
+    depends_on: { migrate: { condition: service_completed_successfully }, topics: { condition: service_completed_successfully } }
+  gateway:
+    build: { context: .., dockerfile: services/gateway/Dockerfile }
+    environment:
+      DATABASE_URL: postgresql://gateway_role:gateway_dev@postgres:5432/ulpf
+    ports: ["8000:8000"]
+    depends_on: { migrate: { condition: service_completed_successfully } }
+  web:
+    build: { context: .., dockerfile: web/Dockerfile }
+    ports: ["3000:3000"]
+    depends_on: [ gateway ]
+  simulator:
+    profiles: [ sim ]
+    build: { context: .., dockerfile: simulator/Dockerfile }
+    environment: { COLLECTOR_UDP: collector:5514, COLLECTOR_HTTP: http://collector:8080 }
+    depends_on: [ collector ]
+volumes: { pgdata: {} }
