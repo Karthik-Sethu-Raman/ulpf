@@ -1,7 +1,7 @@
 # simulator/simulate.py — multi-vendor traffic simulator over the frozen golden corpora.
 #
 # Routes each corpus to the transport the collector expects (R7):
-#   cef/syslog/acmegw -> UDP datagrams, one log line each, no envelope (the
+#   cef/syslog/acmegw/newapp -> UDP datagrams, one log line each, no envelope (the
 #                        collector derives source_id from the peer address, so
 #                        there is nothing to tag on the wire);
 #   json              -> batched HTTP POSTs to /v1/ingest, source_id "ids01"
@@ -10,7 +10,15 @@
 # Pacing: --eps is the TOTAL event rate, distributed evenly across the corpora
 # found on disk; corpora are interleaved round-robin, one line per corpus per
 # tick. --loop repeats the corpora until --duration elapses; without it, each
-# corpus is sent once through (still paced), then the run ends.
+# corpus is sent once through (still paced), then the run ends. --duration is a
+# hard budget in both modes: no send may start after the deadline, checked
+# between passes AND mid-pass.
+#
+# Modes (T10): "steady" replays only the M1 golden corpora. "new-appliance"
+# additionally loads the newapp corpus (an unknown proprietary format for the
+# M2 onboarding loop) after --new-after seconds: until then its rotation slot
+# is idle — no send, no cursor advance — so the already-running corpora are
+# untouched while it waits.
 #
 # Stdout contract (parsed by the M1 smoke test): exactly one line per corpus,
 #   <name> sent=<N>
@@ -28,6 +36,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 import httpx
 
@@ -37,9 +46,10 @@ HTTP_SOURCE_ID = "ids01"
 HTTP_BATCH_SIZE = 10
 HTTP_TIMEOUT_S = 5.0
 
-UDP_KEYS = frozenset({"cef", "syslog", "acmegw"})
+UDP_KEYS = frozenset({"cef", "syslog", "acmegw", "newapp"})
 HTTP_KEYS = frozenset({"json"})
 CORPUS_KEYS = sorted(UDP_KEYS | HTTP_KEYS)
+NEWAPP_KEY = "newapp"  # loaded only in --mode new-appliance (see load_corpora)
 
 
 def transport_for(key: str) -> str:
@@ -121,11 +131,26 @@ class HttpSender:
         await self._client.aclose()
 
 
+@runtime_checkable
+class Sender(Protocol):
+    """Anything that can carry corpus lines (structural — no declaration needed).
+
+    UdpSender, HttpSender and the tests' fakes all qualify by shape:
+    async send(line)->int, flush()->int. close() is intentionally not part of
+    the protocol: it is sync on UdpSender, async on HttpSender, and _close_all
+    already handles both.
+    """
+
+    async def send(self, line: str) -> int: ...
+    async def flush(self) -> int: ...
+
+
 @dataclass
 class Corpus:
     name: str
     lines: list[str]
-    sender: object  # UdpSender / HttpSender / test double: async send(line)->int, flush()->int
+    sender: Sender
+    start_at: float = 0.0  # seconds from run start before this corpus joins the rotation
 
 
 def load_lines(path: Path) -> list[str]:
@@ -136,10 +161,19 @@ def load_lines(path: Path) -> list[str]:
     return lines
 
 
-def load_corpora(corpus_dir: Path | str, senders: dict) -> list[Corpus]:
+def load_corpora(corpus_dir: Path | str, senders: dict,
+                 include_newapp: bool = False) -> list[Corpus]:
+    """Load raw_logs_<key>.txt per corpus key; default (steady) excludes newapp.
+
+    include_newapp=True is --mode new-appliance: the unknown-format corpus
+    joins the load so onboarding can meet a format it has no rule for. The
+    default keeps the M1 smoke's stdout contract byte-identical.
+    """
     corpus_dir = Path(corpus_dir)
     corpora = []
     for key in CORPUS_KEYS:
+        if key == NEWAPP_KEY and not include_newapp:
+            continue  # steady mode: the unknown appliance stays off the wire
         path = corpus_dir / f"raw_logs_{key}.txt"
         if not path.is_file():
             print(f"warning: corpus file missing, skipping: {path}", file=sys.stderr)
@@ -170,6 +204,9 @@ async def run(corpora: list[Corpus], *, eps: float, duration: float,
               loop: bool = False) -> tuple[dict, int]:
     """Send the corpora round-robin at eps total events/sec.
 
+    A corpus with start_at > 0 stays idle (no send, no cursor advance) until
+    that many seconds have elapsed, then joins the rotation in place.
+
     Returns (sent_per_corpus, error_count). A send counts only when the
     transport accepted it (UDP sendto returned; HTTP got a 202).
     """
@@ -186,11 +223,17 @@ async def run(corpora: list[Corpus], *, eps: float, duration: float,
 
     pass_no = 0
     while True:
-        if loop and time.monotonic() >= deadline:
+        if time.monotonic() >= deadline:  # hard budget in loop AND one-shot mode
             break
         if not loop and all(cursors[i] >= len(corpora[i].lines) for i in range(n)):
             break
+        stopped = False
         for i, corpus in enumerate(corpora):
+            if time.monotonic() >= deadline:
+                stopped = True  # mid-pass: a pass that would overrun stops here
+                break
+            if time.monotonic() - start < corpus.start_at:
+                continue  # not yet due (start_at): its slot is idle this pass
             if cursors[i] >= len(corpus.lines):
                 if not loop:
                     continue
@@ -202,6 +245,8 @@ async def run(corpora: list[Corpus], *, eps: float, duration: float,
             except Exception as exc:  # noqa: BLE001 - one failed send counts and moves on
                 errors += 1
                 print(f"error: {corpus.name}: {exc}", file=sys.stderr)
+        if stopped:
+            break
         pass_no += 1
         delay = start + pass_no * tick - time.monotonic()
         if delay > 0:
@@ -231,11 +276,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--eps", type=float, default=20.0,
                    help="total events/sec across all corpora (default 20)")
     p.add_argument("--duration", type=float, default=60.0,
-                   help="seconds to run when --loop is set (default 60)")
+                   help="seconds before the run is cut off (hard budget in both "
+                        "modes; --loop repeats until then) (default 60)")
     p.add_argument("--corpora", default=None,
                    help="directory holding raw_logs_*.txt (default: simulator/data)")
     p.add_argument("--loop", action="store_true",
                    help="repeat the corpora until --duration elapses")
+    p.add_argument("--mode", choices=("steady", "new-appliance"), default="steady",
+                   help="steady: golden corpora only (default); new-appliance: "
+                        "also replay the unknown-format newapp corpus (T10)")
+    p.add_argument("--new-after", type=float, default=0.0, dest="new_after",
+                   help="new-appliance only: seconds before the newapp corpus "
+                        "joins the rotation (default 0; steady ignores this)")
     return p.parse_args(argv)
 
 
@@ -252,11 +304,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    corpora = load_corpora(corpus_dir, senders)
+    include_newapp = args.mode == "new-appliance"
+    corpora = load_corpora(corpus_dir, senders, include_newapp=include_newapp)
     if not corpora:
         print(f"error: no corpora found in {corpus_dir}", file=sys.stderr)
         asyncio.run(_close_all(senders))
         return 1
+    for corpus in corpora:
+        if corpus.name == NEWAPP_KEY:
+            corpus.start_at = max(args.new_after, 0.0)
 
     async def drive():
         try:
