@@ -18,6 +18,12 @@
 # flipped to superseded BEFORE the new row goes active, or the later statement
 # raises a unique violation.
 #
+# TOCTOU: every status-transition UPDATE carries its expected-status predicate
+# (AND status = 'pending_review' / 'active' / IN ('deactivated','superseded'))
+# and checks cur.rowcount — 0 rows means a concurrent writer moved the row
+# between the pre-check and the statement: ConflictError, never a silent no-op
+# that would still write the audit row.
+#
 # House style (T7): connections run AUTOCOMMIT; each public function wraps
 # exactly one `with conn.transaction():` block; every mutation is paired with
 # an audit INSERT (entity = the fingerprint_id; gateway lifecycle actions:
@@ -92,42 +98,90 @@ _SAMPLES_SQL = (
 )
 _AUDIT_SQL = "INSERT INTO audit_log (actor, action, entity, detail) VALUES (%s, %s, %s, %s)"
 
+# Status-transition UPDATEs. The expected-status predicate in each WHERE is
+# the TOCTOU backstop (rowcount 0 -> ConflictError); the SET side touches only
+# the columns migration 003 grants to rules_role.
+_ACTIVATE_PENDING_SQL = (
+    "UPDATE rules SET status = 'active', activated_at = now() "
+    "WHERE id = %s AND status = 'pending_review'"
+)
+_REJECT_PENDING_SQL = (
+    "UPDATE rules SET status = 'rejected' "
+    "WHERE id = %s AND status = 'pending_review'"
+)
+_DEACTIVATE_ACTIVE_SQL = (
+    "UPDATE rules SET status = 'deactivated', deactivated_at = now() "
+    "WHERE id = %s AND status = 'active'"
+)
+_REACTIVATE_SQL = (
+    "UPDATE rules SET status = 'active', activated_at = now() "
+    "WHERE id = %s AND status IN ('deactivated', 'superseded')"
+)
+
 
 # --- plumbing -------------------------------------------------------------------
 
-def _run(op, conn, /, *args):
-    """Run one txn-wrapped operation; open/close the connection when none is
-    injected (tests always inject a fake). IntegrityError on the candidate
-    INSERT — a concurrent writer won the version/pending race — retries the
-    whole operation ONCE, then surfaces ConflictError (409)."""
+_CONFLICT_MSG = "concurrent modification; the rule state changed — retry"
+
+
+def _execute(op, conn, /, *args):
+    """Run op once; open/close the connection when none is injected (tests
+    always inject a fake)."""
     if conn is None:
         conn = _connect_write()
         try:
-            return _with_insert_retry(op, conn, *args)
+            return op(conn, *args)
         finally:
             conn.close()
-    return _with_insert_retry(op, conn, *args)
+    return op(conn, *args)
 
 
-def _with_insert_retry(op, conn, *args):
+def _run(op, conn, /, *args):
+    """Single-shot run. Any IntegrityError — a unique-index race on an UPDATE,
+    or a CHECK/FK violation — is logged with its detail and answered
+    ConflictError (409), never retried and never a raw 500. Only the
+    candidate-INSERT path retries (see _run_candidate_insert)."""
     import psycopg
 
     try:
-        return op(conn, *args)
-    except psycopg.IntegrityError:
-        log.warning("concurrent candidate insert lost the race; retrying once")
+        return _execute(op, conn, *args)
+    except psycopg.IntegrityError as exc:
+        log.warning("constraint violation, answering 409 without retry: %s", exc)
+        raise ConflictError(_CONFLICT_MSG) from exc
+
+
+def _run_candidate_insert(op, conn, /, *args):
+    """The brief's pinned race, scoped to ops whose mutating statement is the
+    rules INSERT (manual create, approve-with-content): a concurrent writer
+    winning the version/pending/active race retries the whole txn ONCE — the
+    re-run re-reads state inside a fresh transaction and either wins or
+    conflicts. UPDATE-side races take the single-shot 409 from _run; CHECK/FK
+    violations are not retried pointlessly."""
+    import psycopg
+
+    for attempt in (1, 2):
         try:
-            return op(conn, *args)
+            return _execute(op, conn, *args)
         except psycopg.IntegrityError as exc:
-            raise ConflictError(
-                "concurrent modification; the rule state changed — retry"
-            ) from exc
+            log.warning("rules INSERT integrity error (attempt %d/2): %s",
+                        attempt, exc)
+    raise ConflictError(_CONFLICT_MSG)
 
 
 def _audit(cur, action: str, entity: str, detail: dict, *, actor: str) -> None:
     from psycopg.types.json import Json  # deferred: keeps psycopg off the import path
 
     cur.execute(_AUDIT_SQL, (actor, action, entity, Json(detail)))
+
+
+def _mutate(cur, sql: str, params, conflict: str) -> None:
+    """Run a status-transition UPDATE and enforce its expected-status
+    predicate: rowcount 0 means another writer changed the row between the
+    pre-check and this statement — ConflictError, never a silent no-op that
+    would still write the audit row."""
+    cur.execute(sql, params)
+    if cur.rowcount == 0:
+        raise ConflictError(conflict)
 
 
 def _load_candidate(cur, fingerprint_id: str, candidate_id: int) -> dict:
@@ -184,15 +238,16 @@ def _insert_rule(cur, *, fingerprint_id: str, version: int, pattern: str, mappin
                  report) -> int:
     from psycopg.types.json import Json
 
-    # status is a module-controlled literal ('active' / 'pending_review'), never
-    # request input — interpolated to match the onboarding store's INSERT shape
-    # (the rules status CHECK constraint is the real guard).
+    # status is a module-controlled vocabulary value ('active' /
+    # 'pending_review'), never request input — but it is bound as a parameter
+    # like every other value (parameterized SQL only); the rules status CHECK
+    # constraint is the real guard.
     cur.execute(
-        "INSERT INTO rules (fingerprint_id, version, pattern, mappings, provenance, "
-        f"confidence, status, created_by, validation) "
-        f"VALUES (%s, %s, %s, %s, %s, %s, '{status}', %s, %s) RETURNING id",
-        (fingerprint_id, version, pattern, Json(mappings), provenance, confidence,
-         created_by, Json(report_to_json(report))),
+        "INSERT INTO rules (fingerprint_id, version, pattern, mappings, status, "
+        "provenance, confidence, created_by, validation) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        (fingerprint_id, version, pattern, Json(mappings), status, provenance,
+         confidence, created_by, Json(report_to_json(report))),
     )
     return cur.fetchone()["id"]
 
@@ -210,8 +265,12 @@ def approve_candidate(fingerprint_id: str, candidate_id: int, *, actor: str = "a
     gate against the fingerprint's samples, a NEW row version = MAX+1 is
     INSERTed already active (provenance 'slm-edited' / 'human'), and the draft
     candidate is flipped to rejected (audited with consumed_by_edit)."""
-    return _run(_approve_once, conn, fingerprint_id, candidate_id, actor, reason,
-                edited_mappings, override)
+    # Only the with-content path contains a rules INSERT, so only it gets the
+    # candidate-insert retry; the plain path single-shots (see _run).
+    runner = (_run if edited_mappings is None and override is None
+              else _run_candidate_insert)
+    return runner(_approve_once, conn, fingerprint_id, candidate_id, actor, reason,
+                  edited_mappings, override)
 
 
 def _edited_content(candidate: dict, edited_mappings, override):
@@ -235,10 +294,9 @@ def _approve_once(conn, fingerprint_id, candidate_id, actor, reason, edited_mapp
             # Plain approve: supersede the prior active row BEFORE this one goes
             # active (partial-unique gotcha), then flip status + timestamps only.
             prior_version = _supersede_active(cur, fingerprint_id)
-            cur.execute(
-                "UPDATE rules SET status = 'active', activated_at = now() WHERE id = %s",
-                (candidate_id,),
-            )
+            _mutate(cur, _ACTIVATE_PENDING_SQL, (candidate_id,),
+                    f"candidate {candidate_id} is no longer pending_review "
+                    "(concurrent modification)")
             _audit(cur, "rule_approved", fingerprint_id, {
                 "rule_id": candidate_id,
                 "version": candidate["version"],
@@ -267,7 +325,9 @@ def _approve_once(conn, fingerprint_id, candidate_id, actor, reason, edited_mapp
                               pattern=pattern, mappings=mappings, provenance=provenance,
                               confidence=confidence, status="active", created_by=actor,
                               report=report)
-        cur.execute("UPDATE rules SET status = 'rejected' WHERE id = %s", (candidate_id,))
+        _mutate(cur, _REJECT_PENDING_SQL, (candidate_id,),
+                f"candidate {candidate_id} is no longer pending_review "
+                "(concurrent modification)")
         _audit(cur, "rule_approved", fingerprint_id, {
             "rule_id": new_id,
             "version": version,
@@ -294,7 +354,9 @@ def _reject_once(conn, fingerprint_id, candidate_id, actor, reason):
     with conn.transaction(), conn.cursor() as cur:
         candidate = _load_candidate(cur, fingerprint_id, candidate_id)
         _require_pending(candidate)
-        cur.execute("UPDATE rules SET status = 'rejected' WHERE id = %s", (candidate_id,))
+        _mutate(cur, _REJECT_PENDING_SQL, (candidate_id,),
+                f"candidate {candidate_id} is no longer pending_review "
+                "(concurrent modification)")
         _audit(cur, "rule_rejected", fingerprint_id, {
             "rule_id": candidate_id,
             "version": candidate["version"],
@@ -315,8 +377,8 @@ def create_manual_candidate(fingerprint_id: str, pattern: str, mappings, *,
     activation path, uniform audit. Validation failure writes nothing and
     raises ValidationError (app -> 422 with checks + notes). With no samples
     the gate degrades to pass-with-note, so an unseen format can be authored."""
-    return _run(_create_manual_once, conn, fingerprint_id, pattern, list(mappings),
-                actor, confidence)
+    return _run_candidate_insert(_create_manual_once, conn, fingerprint_id, pattern,
+                                 list(mappings), actor, confidence)
 
 
 def _create_manual_once(conn, fingerprint_id, pattern, mappings, actor, confidence):
@@ -362,10 +424,8 @@ def _deactivate_once(conn, fingerprint_id, actor, reason):
         row = cur.fetchone()
         if row is None:
             raise NotFoundError(f"no active rule for fingerprint {fingerprint_id!r}")
-        cur.execute(
-            "UPDATE rules SET status = 'deactivated', deactivated_at = now() WHERE id = %s",
-            (row["id"],),
-        )
+        _mutate(cur, _DEACTIVATE_ACTIVE_SQL, (row["id"],),
+                f"rule {row['id']} is no longer active (concurrent modification)")
         _audit(cur, "rule_deactivated", fingerprint_id, {
             "rule_id": row["id"],
             "version": row["version"],
@@ -379,8 +439,11 @@ def _deactivate_once(conn, fingerprint_id, actor, reason):
 def reactivate_rule(rule_id: int, *, actor: str = "anonymous",
                     reason: str | None = None,
                     conn: psycopg.Connection | None = None) -> dict:
-    """Reactivate a rule row (status -> active, activated_at = now); 409 when
-    another version of the fingerprint is already active (rules_one_active)."""
+    """Reactivate a rule row (status -> active, activated_at = now). Only
+    deactivated and superseded rows come back — the rollback path; 409 for a
+    pending/rejected/active target (approve is the ONE activation path) and
+    when another version of the fingerprint is already active
+    (rules_one_active)."""
     return _run(_reactivate_once, conn, rule_id, actor, reason)
 
 
@@ -393,8 +456,10 @@ def _reactivate_once(conn, rule_id, actor, reason):
         row = cur.fetchone()
         if row is None:
             raise NotFoundError(f"rule {rule_id} not found")
-        if row["status"] == "active":
-            raise ConflictError(f"rule {rule_id} is already active")
+        if row["status"] in ("active", "pending_review", "rejected"):
+            raise ConflictError(
+                f"rule {rule_id} is {row['status']!r}; only deactivated or "
+                "superseded rules reactivate")
         cur.execute(
             "SELECT id FROM rules "
             "WHERE fingerprint_id = %s AND status = 'active' AND id <> %s",
@@ -405,10 +470,9 @@ def _reactivate_once(conn, rule_id, actor, reason):
             raise ConflictError(
                 f"rule {other['id']} is already active for fingerprint "
                 f"{row['fingerprint_id']!r}")
-        cur.execute(
-            "UPDATE rules SET status = 'active', activated_at = now() WHERE id = %s",
-            (rule_id,),
-        )
+        _mutate(cur, _REACTIVATE_SQL, (rule_id,),
+                f"rule {rule_id} changed state concurrently; expected "
+                "deactivated or superseded")
         _audit(cur, "rule_reactivated", row["fingerprint_id"], {
             "rule_id": rule_id,
             "version": row["version"],
