@@ -59,6 +59,18 @@ class DownSLM:
         raise ConnectionError("ollama unreachable")
 
 
+class BrokenSLM:
+    """A NON-ConnectionError transport failure (httpx.ConnectError and
+    ollama.ResponseError are not builtin subclasses) on every call."""
+
+    def __init__(self):
+        self.temperatures: list[float] = []
+
+    def chat(self, prompt: str, temperature: float) -> str:
+        self.temperatures.append(temperature)
+        raise RuntimeError("some other transport boom")
+
+
 def test_build_prompt_contains_few_shots_and_samples():
     prompt = build_prompt(_SAMPLES)
     assert "LEEF:2.0|Acme|NetGuard" in prompt  # few-shot example 1 (LEEF)
@@ -99,6 +111,13 @@ def test_generate_candidate_wraps_connection_error_after_max_attempts():
     assert fake.calls == 3
 
 
+def test_generate_candidate_retries_any_transport_error_type():
+    fake = BrokenSLM()
+    with pytest.raises(GenerationError):
+        generate_candidate("fp_x", _SAMPLES, fake, max_attempts=3)
+    assert fake.temperatures == pytest.approx([0.1, 0.3, 0.5])
+
+
 def test_generate_candidate_without_lines_raises_generation_error():
     with pytest.raises(GenerationError):
         generate_candidate("fp_x", [], FakeSLM([_VALID]))
@@ -129,3 +148,11 @@ def test_generate_json_rule_maps_aliases_and_sets_sentinel():
 def test_generate_json_rule_requires_parseable_lines():
     with pytest.raises(ValueError):
         generate_json_rule("fp_json", ["not json at all"])
+
+
+def test_generate_json_rule_rejects_zero_mappings():
+    # A JSON format hitting none of the 8 alias entries would yield
+    # mappings=[] — every gate check is vacuously true for it, so the rule
+    # must be refused instead of stored as a useless pending_review row.
+    with pytest.raises(GenerationError, match="no mappable fields via alias table"):
+        generate_json_rule("fp_json", ['{"widget": "x"}', '{"widget": "y"}'])

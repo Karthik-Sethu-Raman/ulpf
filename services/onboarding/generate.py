@@ -20,11 +20,14 @@
 #   - set iteration is sorted before alias matching so the generated rule is
 #     deterministic across runs (the demo iterated a raw set).
 import json
+import logging
 import re
 from typing import Protocol
 
 from ulpf_core.models import Mapping, Rule
 from ulpf_core.parsing import EXTENSION_KV, JSON_SENTINEL, OCSF_TARGETS
+
+log = logging.getLogger("onboarding.generate")
 
 
 class GenerationError(RuntimeError):
@@ -265,6 +268,14 @@ def generate_json_rule(fingerprint_id: str, sample_lines: list[str]) -> Generate
                 field_mappings.append(Mapping(source_field=flat_key, ocsf_path=ocsf_path))
                 break  # first match wins per target field
 
+    if not field_mappings:
+        # A zero-mapping rule passes every validation check vacuously — a
+        # useless pending_review candidate that blocks the fingerprint until
+        # a human rejects it (T5-M2). Refuse instead.
+        raise GenerationError(
+            f"no mappable fields via alias table for fingerprint '{fingerprint_id}' "
+            f"(keys seen: {sorted(all_flat_keys)})")
+
     return GeneratedRule(
         fingerprint_id=fingerprint_id,
         pattern=JSON_SENTINEL,
@@ -346,8 +357,22 @@ def generate_candidate(fingerprint_id: str, prompt_lines: list[str], client: SLM
     last_error: Exception | None = None
 
     for attempt in range(1, max_attempts + 1):
+        temperature = 0.1 + (attempt - 1) * 0.2
         try:
-            content = client.chat(prompt, 0.1 + (attempt - 1) * 0.2)
+            content = client.chat(prompt, temperature)
+        except Exception as exc:
+            # ANY failure from the transport call is a transport failure for
+            # retry purposes (T5-M3): builtin ConnectionError, but also
+            # httpx.ConnectError / ollama.ResponseError, which are NOT
+            # builtin subclasses — without this the ladder would fail fast
+            # on attempt 1. Counted like any failed attempt; never fed back
+            # as rule feedback. The exc_info log surfaces the outage and
+            # keeps the broad catch lint-legal (BLE001).
+            log.warning("SLM chat failed (attempt %d/%d): %s", attempt, max_attempts,
+                        exc, exc_info=True)
+            last_error = exc
+            continue
+        try:
             parsed = extract_json(content)
 
             pattern = parsed["pattern"]
@@ -358,6 +383,11 @@ def generate_candidate(fingerprint_id: str, prompt_lines: list[str], client: SLM
             ]
 
             if pattern == JSON_SENTINEL:
+                if not mappings:
+                    # Same vacuity as the fast-path (T5-M2): a sentinel rule
+                    # with zero mappings passes every check vacuously — send
+                    # it back through the feedback loop instead.
+                    raise ValueError("JSON rule carried zero field mappings")
                 confidence = _json_confidence(prompt_lines, mappings)
             else:
                 re.compile(pattern)  # must compile before we trust it
@@ -376,8 +406,7 @@ def generate_candidate(fingerprint_id: str, prompt_lines: list[str], client: SLM
                 provenance="slm",
                 version=1,
             )
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError, re.error,
-                ConnectionError) as exc:
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, re.error) as exc:
             last_error = exc
             prompt = (base_prompt +
                       f"\n\nYour previous response failed with error: {exc}\n"

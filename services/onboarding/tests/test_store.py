@@ -14,6 +14,7 @@ from onboarding.config import Config
 from onboarding.generate import GeneratedRule
 from onboarding.store import (
     audit,
+    count_samples,
     has_active_or_pending,
     insert_candidate,
     load_samples,
@@ -250,6 +251,14 @@ def test_record_attempt_upserts_the_attempt_row():
     assert sql.startswith("INSERT INTO onboarding_attempts")
     assert "ON CONFLICT (fingerprint_id) DO UPDATE" in sql
     assert conn.params[conn.sql.index(sql)] == ("fp_a", 20, "validation failed: boom")
+
+
+def test_count_samples_counts_total_for_fingerprint():
+    conn = FakeConn(fetchone_results=[[45]])
+    assert count_samples(conn, "fp_a") == 45
+    sql = next(s for s in conn.sql if isinstance(s, str))
+    assert sql == "SELECT count(*) FROM onboarding_samples WHERE fingerprint_id = %s"
+    assert conn.params[conn.sql.index(sql)] == ("fp_a",)
 
 
 def test_audit_inserts_row_with_actor_entity_detail():

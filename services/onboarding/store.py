@@ -76,6 +76,20 @@ def load_samples(conn: psycopg.Connection, fingerprint_id: str, limit: int) -> l
         return [{"id": row[0], "raw_text": row[1]} for row in cur.fetchall()]
 
 
+def count_samples(conn: psycopg.Connection, fingerprint_id: str) -> int:
+    """TOTAL onboarding_samples rows for the fingerprint (any role) — the
+    same units _READY_SQL's s.total is counted in, so samples_seen
+    bookkeeping and the retry_new_samples throttle stay commensurate
+    (T5-F1: recording the capped loaded count defeated the throttle for
+    backlogged fingerprints)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM onboarding_samples WHERE fingerprint_id = %s",
+            (fingerprint_id,),
+        )
+        return cur.fetchone()[0]
+
+
 def mark_roles(conn: psycopg.Connection, split: dict[str, list[dict]]) -> None:
     """Persist the re-split scoped by id lists (idempotent on re-run). Always
     three UPDATEs — an empty id list matches nothing but keeps the role

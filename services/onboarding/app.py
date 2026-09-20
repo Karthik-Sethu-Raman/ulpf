@@ -24,6 +24,7 @@ from onboarding.samples import assign_roles
 from onboarding.store import (
     audit,
     connect_db,
+    count_samples,
     has_active_or_pending,
     insert_candidate,
     load_samples,
@@ -76,13 +77,13 @@ def process_fingerprint(cfg: Config, fingerprint_id: str) -> bool:
         # GenerationError / SLM unreachable / JSON edge — fail closed. Full
         # traceback to the log; the summary goes to the attempt record.
         log.exception("generation failed for %s", fingerprint_id)
-        _record_failure(cfg, fingerprint_id, len(rows), f"generation failed: {exc}")
+        _record_failure(cfg, fingerprint_id, f"generation failed: {exc}")
         return False
 
     report = validate_candidate(rule, prompt_lines, held_out_lines)
     if not report.passed:
         summary = "; ".join(report.notes[:3]) or "validation failed"
-        _record_failure(cfg, fingerprint_id, len(rows), f"validation failed: {summary}")
+        _record_failure(cfg, fingerprint_id, f"validation failed: {summary}")
         return False
 
     with connect_db(cfg.database_url) as conn:
@@ -95,16 +96,23 @@ def process_fingerprint(cfg: Config, fingerprint_id: str) -> bool:
     return True
 
 
-def _record_failure(cfg: Config, fingerprint_id: str, samples_seen: int,
-                    error: str) -> None:
+def _record_failure(cfg: Config, fingerprint_id: str, error: str) -> None:
     """record_attempt + audit(candidate_failed); itself failure-tolerant —
-    a bookkeeping write must never kill the loop."""
+    a bookkeeping write must never kill the loop.
+
+    samples_seen records the fingerprint's TOTAL sample count (store.
+    count_samples — the same units _READY_SQL's s.total is compared against),
+    NOT the capped loaded count: with the loaded count, a fingerprint whose
+    backlog kept growing during an outage satisfies total - samples_seen >=
+    retry_new_samples forever and is re-attempted every poll (T5-F1).
+    """
     log.warning("candidate failed for %s: %s", fingerprint_id, error)
     try:
         with connect_db(cfg.database_url) as conn:
-            record_attempt(conn, fingerprint_id, samples_seen, error)
+            total = count_samples(conn, fingerprint_id)
+            record_attempt(conn, fingerprint_id, total, error)
             audit(conn, "candidate_failed", fingerprint_id,
-                  {"error": error, "samples_seen": samples_seen})
+                  {"error": error, "samples_seen": total})
     except Exception:
         log.exception("failed to record the attempt for %s", fingerprint_id)
 
