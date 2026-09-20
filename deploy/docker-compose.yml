@@ -54,6 +54,9 @@ services:
     build: { context: .., dockerfile: services/gateway/Dockerfile }
     environment:
       DATABASE_URL: postgresql://gateway_role:gateway_dev@postgres:5432/ulpf
+      # M2 write path (Task 7): lifecycle mutations as the least-privilege
+      # rules_role; reads keep the read-only gateway_role DSN above.
+      WRITE_DATABASE_URL: postgresql://rules_role:rules_dev@postgres:5432/ulpf
     ports: ["8000:8000"]
     depends_on: { migrate: { condition: service_completed_successfully } }
   web:
