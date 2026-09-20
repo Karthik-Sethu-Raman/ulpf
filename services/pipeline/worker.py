@@ -3,16 +3,20 @@
 # Per batch of up to 500 messages (or 2s), the spec-critical ordering (§4):
 #   1. build_rows (fingerprint at build time, controller R3)
 #   2. persist_batch  — raw_events + raw_batches chain, COMMITTED
-#   3. refresh active rules
+#   3. refresh active rules; one grouped count query for this batch's
+#      rule-less fingerprints' existing onboarding samples
 #   4. per event: apply active rule or 'unparsed'; parse failures -> parse_error
-#      + pipeline.dlq; parsed docs -> normalized.events (key=fingerprint_id)
-#   5. persist_normalized — COMMITTED
+#      + pipeline.dlq; EVERY event (all three statuses) ships a compact
+#      normalized.events envelope keyed by fingerprint_id (R17)
+#   5. persist_normalized — COMMITTED (sample capture rides the SAME txn,
+#      capped per fingerprint, ON CONFLICT (raw_id) DO NOTHING)
 #   6. only then consumer.commit()
 # Crash/rollback anywhere before step 6 and the worker seeks each affected
 # partition back to the failed batch's first offset (consume() had already
 # advanced the position; the next no-arg commit() would otherwise cover the
 # failed batch and its events would be silently lost). Redelivery is a no-op
-# on the DB side: every write is deterministic and ON CONFLICT-guarded (§4).
+# on the DB side: every write is deterministic and ON CONFLICT-guarded (§4),
+# samples included (raw_id unique, so one line -> at most one sample).
 #
 # parsed_at is the raw event's received_at (not wall clock) so a replay mints
 # the same event_id and collides instead of duplicating. M1 never supersedes
@@ -23,9 +27,17 @@ import os
 
 from ocsf_schema.validator import validate_document
 from ulpf_core.ids import event_id_for
+from ulpf_core.models import EventEnvelope
 from ulpf_core.parsing import parse
 
-from pipeline.db import NormalizedRow, build_rows, persist_batch, persist_normalized
+from pipeline.db import (
+    NormalizedRow,
+    build_rows,
+    collect_samples,
+    persist_batch,
+    persist_normalized,
+    sample_counts,
+)
 from pipeline.rules import load_active_rules
 
 log = logging.getLogger("pipeline.worker")
@@ -39,6 +51,11 @@ BATCH_SIZE = 500
 BATCH_TIMEOUT_S = 2.0
 MAX_LINE_CHARS = 65536  # spec §10 line cap — re-checked before parse (collector checks at ingest)
 CANARY_EVERY = 100      # every 100th parsed doc through validate_document (spec §6.4)
+
+# Sample capture cap (R17): at most N raw lines retained per rule-less
+# fingerprint for M2's prompt/held-out split. Env-tunable so tests and ops
+# can shrink it without a code change.
+SAMPLE_CAPTURE_CAP = int(os.environ.get("ULPF_SAMPLE_CAPTURE_CAP", "200"))
 
 # Sentinel rule version for events no active rule matched: deterministic, so a
 # replay of the same raw line yields the same event_id and is skipped.
@@ -91,8 +108,19 @@ class KafkaProducer:
         self._producer = confluent_kafka.Producer({"bootstrap.servers": bootstrap})
 
     def produce(self, topic: str, key: str, value: dict) -> None:
-        self._producer.produce(topic, key=key.encode(), value=json.dumps(value).encode())
+        self._producer.produce(
+            topic, key=key.encode(), value=json.dumps(value).encode(),
+            on_delivery=self._on_delivery)  # T7: delivery failures must be visible
         self._producer.poll(0)  # serve delivery callbacks without blocking
+
+    @staticmethod
+    def _on_delivery(err, msg) -> None:
+        """Delivery-report callback (T7): a lost normalized.events or DLQ
+        emission is a silent correctness hole until M3 consumes the topic —
+        surface it at ERROR the moment librdkafka reports it."""
+        if err is not None:
+            topic = msg.topic() if msg is not None else "<unknown>"
+            log.error("kafka delivery failed: topic=%s err=%s", topic, err)
 
     def flush(self, timeout: float = 10.0) -> int:
         return self._producer.flush(timeout)
@@ -176,12 +204,20 @@ class PipelineWorker:
             return False
 
         rules = load_active_rules(self.conn)  # refreshed every batch
+
+        # Sample capture (R17): only fingerprints with NO active rule, capped
+        # per fingerprint by what onboarding_samples already holds. One grouped
+        # count query for the whole batch; known fingerprints query nothing.
+        unknown = sorted({row.fingerprint_id for row in rows} - rules.keys())
+        counts = sample_counts(self.conn, unknown) if unknown else {}
+        samples = collect_samples(rows, rules, counts, SAMPLE_CAPTURE_CAP)
+
         events: list[NormalizedRow] = []
         parsed = unparsed = parse_errors = 0
         for row in rows:
             rule = rules.get(row.fingerprint_id)
             if rule is None:
-                events.append(NormalizedRow(
+                unparsed_row = NormalizedRow(
                     event_id=event_id_for(row.raw_id, UNPARSED_RULE_VERSION),
                     raw_id=row.raw_id,
                     raw_received_at=row.received_at,
@@ -191,21 +227,27 @@ class PipelineWorker:
                     rule_version=UNPARSED_RULE_VERSION,
                     status="unparsed",
                     ocsf=None,
-                ))
+                )
+                events.append(unparsed_row)
                 unparsed += 1
+                self._produce_envelope(unparsed_row)
                 continue
 
             # Line cap re-checked here: parse() runs untrusted text on the hot path.
             if len(row.raw_text) > MAX_LINE_CHARS:
-                events.append(self._parse_error_row(
-                    row, rule, f"line exceeds {MAX_LINE_CHARS} char cap"))
+                capped_row = self._parse_error_row(
+                    row, rule, f"line exceeds {MAX_LINE_CHARS} char cap")
+                events.append(capped_row)
                 parse_errors += 1
+                self._produce_envelope(capped_row)
                 continue
 
             doc, err = parse(row.raw_text, rule)
             if err is not None:
-                events.append(self._parse_error_row(row, rule, err))
+                error_row = self._parse_error_row(row, rule, err)
+                events.append(error_row)
                 parse_errors += 1
+                self._produce_envelope(error_row)
                 continue
 
             # parse() leaves time None when the rule maps no timestamp; the
@@ -220,7 +262,7 @@ class PipelineWorker:
                     self.canary_failures += 1
                     log.error("canary doc invalid for %s: %s", row.fingerprint_id, problems)
 
-            events.append(NormalizedRow(
+            parsed_row = NormalizedRow(
                 event_id=event_id_for(row.raw_id, rule.version),
                 raw_id=row.raw_id,
                 raw_received_at=row.received_at,
@@ -230,20 +272,16 @@ class PipelineWorker:
                 rule_version=rule.version,
                 status="parsed",
                 ocsf=doc,
-            ))
-            try:
-                self.producer.produce(TOPIC_NORMALIZED, row.fingerprint_id, doc)
-            except Exception:
-                # The normalized row is durable in step 5 regardless; a lost
-                # emission is visible via the DB and must not stall the batch.
-                log.exception("produce to %s failed for %s", TOPIC_NORMALIZED, row.raw_id)
+            )
+            events.append(parsed_row)
+            self._produce_envelope(parsed_row)
             parsed += 1
 
         try:
-            persist_normalized(self.conn, events)
+            persist_normalized(self.conn, events, samples)
         except Exception:
             self.conn.rollback()
-            self._seek_back(msgs)  # redeliver THIS batch (raw rows ON CONFLICT dedup)
+            self._seek_back(msgs)  # redeliver THIS batch (raw rows + samples dedup on replay)
             log.exception("normalized persist failed; seeked back to first failed offsets; "
                           "offsets NOT committed; batch redelivered")
             return False
@@ -254,10 +292,32 @@ class PipelineWorker:
         # commit would silently cover it.
         self.consumer.commit()
         log.info("batch: %d consumed, %d parsed, %d unparsed, %d parse_error, "
-                 "%d skipped-envelope, canary_failures=%d",
+                 "%d skipped-raw, %d samples, canary_failures=%d",
                  len(msgs), parsed, unparsed, parse_errors, len(msgs) - len(rows),
-                 self.canary_failures)
+                 len(samples), self.canary_failures)
         return True
+
+    def _produce_envelope(self, row: NormalizedRow) -> None:
+        """R17: ship the event's compact envelope to normalized.events, keyed
+        by fingerprint_id. M3's drift service consumes ALL THREE statuses, so
+        unparsed/parse_error carry ocsf=None (rule_version 0 / rule.version)."""
+        version = (row.rule_version if row.rule_version is not None
+                   else UNPARSED_RULE_VERSION)
+        envelope = EventEnvelope(
+            event_id=str(row.event_id),
+            raw_id=str(row.raw_id),
+            fingerprint_id=row.fingerprint_id,
+            rule_version=version,
+            status=row.status,
+            ocsf=row.ocsf,
+        )
+        try:
+            self.producer.produce(TOPIC_NORMALIZED, row.fingerprint_id,
+                                  envelope.model_dump())
+        except Exception:
+            # The normalized row is durable in step 5 regardless; a lost
+            # emission is visible via the DB and must not stall the batch.
+            log.exception("produce to %s failed for %s", TOPIC_NORMALIZED, row.raw_id)
 
     def _parse_error_row(self, row, rule, error: str) -> NormalizedRow:
         """DLQ produce + the parse_error row, which joins the same normalized
@@ -286,10 +346,14 @@ class PipelineWorker:
 
 
 def connect_db(url: str):
-    """psycopg connection for pipeline_role (INSERT+SELECT only, no UPDATE/DELETE)."""
+    """psycopg connection for pipeline_role (INSERT+SELECT only, no UPDATE/DELETE).
+
+    autocommit=True (T7): each persist_* wraps its own `with conn.transaction():`
+    block — nothing idles inside an open transaction between batches, and the
+    context manager still commits/rolls back atomically per write."""
     import psycopg  # deferred: unit tests never need psycopg
 
-    return psycopg.connect(url)
+    return psycopg.connect(url, autocommit=True)
 
 
 def main():

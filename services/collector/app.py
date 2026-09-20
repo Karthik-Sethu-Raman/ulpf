@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from ulpf_core.models import RawEnvelope
 
 from collector.producer import KafkaProducer
@@ -106,6 +106,13 @@ async def handle_syslog_tcp(producer, reader: asyncio.StreamReader, writer: asyn
             producer.produce_raw(env)
     except (ConnectionError, asyncio.IncompleteReadError):
         pass  # client went away mid-line; nothing to salvage
+    except ValueError:
+        # readline() past the StreamReader limit (run_syslog_tcp passes
+        # limit=MAX_LINE_CHARS): an oversized TCP line kills the connection —
+        # a byte stream has no line boundary to resync to. UDP, by contrast,
+        # drops only the one oversized datagram (README documents this).
+        log.warning("tcp %s: line exceeds %d char cap; closing connection",
+                    source_id, MAX_LINE_CHARS)
     except Exception:
         log.exception("tcp %s: handler error", source_id)
     finally:
@@ -115,9 +122,14 @@ async def handle_syslog_tcp(producer, reader: asyncio.StreamReader, writer: asyn
 
 
 async def run_syslog_tcp(producer, host: str = "0.0.0.0", port: int = SYSLOG_PORT):
-    """TCP line server; serves until cancelled."""
+    """TCP line server; serves until cancelled.
+
+    limit= caps the StreamReader at MAX_LINE_CHARS: readline() raises ValueError
+    on a longer line, which closes the connection (README: TCP kills the
+    connection where UDP drops just the event — the documented asymmetry)."""
     server = await asyncio.start_server(
-        lambda r, w: handle_syslog_tcp(producer, r, w), host, port
+        lambda r, w: handle_syslog_tcp(producer, r, w), host, port,
+        limit=MAX_LINE_CHARS,
     )
     log.info("syslog tcp listening on %s:%d", host, port)
     async with server:
@@ -126,8 +138,8 @@ async def run_syslog_tcp(producer, host: str = "0.0.0.0", port: int = SYSLOG_POR
 
 class IngestRequest(BaseModel):
     source_id: str
-    lines: list[str]
-    format_hint: str | None = None
+    lines: list[str] = Field(max_length=1000)  # 1000 lines per request, max
+    format_hint: str | None = Field(default=None, max_length=64)
 
 
 def build_app(producer, udp: bool = True):

@@ -12,6 +12,13 @@ exit is `python scripts/smoke.py` (all 5 checks PASS).
 - `scripts/smoke.py` — M1 acceptance gate (live E2E incl. forced replay)
 - `legacy-demo/` — the original hackathon demo, frozen. See its README.
 
+## Collector ingest
+
+Syslog UDP + TCP on 5514, HTTP `POST /v1/ingest` on 8080 (≤1000 lines/request).
+Oversized input is handled asymmetrically by design: UDP drops just the one
+oversized datagram (each datagram is an independent event), while TCP closes
+the connection — a byte stream has no line boundary to resynchronize to.
+
 ## Quickstart (M1)
 
 ```bash
