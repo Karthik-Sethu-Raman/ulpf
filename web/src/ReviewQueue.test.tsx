@@ -15,6 +15,8 @@ vi.mock('./api', () => ({
   getEvents: vi.fn(),
   getRaw: vi.fn().mockResolvedValue(null),
   getRules: vi.fn(),
+  getRuleHistory: vi.fn(),
+  getAudit: vi.fn(),
   getSamples: vi.fn(),
   postJson: vi.fn(),
 }))
@@ -313,7 +315,7 @@ describe('ReviewQueue', () => {
 })
 
 describe('three-tab shell', () => {
-  it('switches between Overview, Review Queue, and the Rules placeholder', async () => {
+  it('switches between Overview, Review Queue, and the Rules registry', async () => {
     mockGetRules.mockResolvedValue({ rules: [pendingRule()] })
     render(<App />)
 
@@ -327,11 +329,14 @@ describe('three-tab shell', () => {
       screen.queryByRole('heading', { name: 'ULPF Overview' }),
     ).toBeNull()
 
+    // Task 9: the Rules tab is the real registry now — the fingerprint row
+    // renders (pending_review shows no Deactivate button)
     fireEvent.click(screen.getByRole('tab', { name: 'Rules' }))
+    expect(await screen.findByText('fp-acme-fw')).not.toBeNull()
+    expect(screen.queryByRole('button', { name: 'Deactivate' })).toBeNull()
     expect(
-      await screen.findByText(/rules management arrives in task 9/i),
-    ).not.toBeNull()
-    expect(screen.queryByText('fp-acme-fw')).toBeNull()
+      screen.queryByRole('heading', { name: 'ULPF Overview' }),
+    ).toBeNull()
 
     fireEvent.click(screen.getByRole('tab', { name: 'Overview' }))
     expect(screen.getByRole('heading', { name: 'ULPF Overview' })).not.toBeNull()

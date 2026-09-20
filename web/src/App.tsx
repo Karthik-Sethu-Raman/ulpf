@@ -1,5 +1,6 @@
 // web/src/App.tsx — the three-tab M2 shell: Overview (the M1 dashboard),
-// Review Queue (Task 8 human review loop) and a Rules placeholder (Task 9).
+// Review Queue (Task 8 human review loop) and the Rules registry + audit
+// trail (Task 9).
 // Tab state is plain useState — no router (air-gapped dashboard: system
 // fonts, zero external requests). Same-origin /api only (dev: Vite proxy,
 // prod: Caddy) — the gateway ships no CORS.
@@ -8,6 +9,7 @@ import { getRaw, getStats } from './api'
 import type { EventRow, OcsfEndpoint, RawTrace, Stats } from './types'
 import { useEventStream } from './useEventStream'
 import ReviewQueue from './ReviewQueue'
+import Rules from './Rules'
 import './App.css'
 
 const STATS_REFRESH_MS = 5000
@@ -234,21 +236,6 @@ function Overview() {
   )
 }
 
-/** Rules tab placeholder — the Rules management page lands in Task 9. */
-function RulesPlaceholder() {
-  return (
-    <section aria-label="Rules">
-      <header className="topbar">
-        <h1>Rules</h1>
-      </header>
-      <div className="card muted placeholder">
-        Rules management arrives in Task 9 — rule history, audit trail, and
-        manual authoring.
-      </div>
-    </section>
-  )
-}
-
 export default function App() {
   const [tab, setTab] = useState<Tab>('overview')
 
@@ -270,7 +257,7 @@ export default function App() {
       </nav>
       {tab === 'overview' && <Overview />}
       {tab === 'review' && <ReviewQueue />}
-      {tab === 'rules' && <RulesPlaceholder />}
+      {tab === 'rules' && <Rules />}
     </div>
   )
 }

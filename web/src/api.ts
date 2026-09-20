@@ -7,8 +7,10 @@
 // The Overview page is fed by the SSE stream; getRules/getSamples serve the
 // M2 review surfaces (Tasks 8/9), mirroring the gateway endpoint shapes.
 import type {
+  AuditResponse,
   EventsResponse,
   RawTrace,
+  RuleHistoryResponse,
   RulesResponse,
   SamplesListResponse,
   SamplesStatus,
@@ -87,6 +89,31 @@ export function getRules(params: { status?: string } = {}): Promise<RulesRespons
   if (params.status) q.set('status', params.status)
   const qs = q.toString()
   return getJson<RulesResponse>(`/api/rules${qs ? `?${qs}` : ''}`)
+}
+
+/** GET /api/rules/{fp} — every version of the fingerprint (newest first)
+ * plus its audit trail (entity = fingerprint_id, latest 200). The Rules page
+ * renders `rules` and takes its feed from getAudit instead: the embedded
+ * `audit` array is redundant (Task 9 ruling) but part of the shape. */
+export function getRuleHistory(
+  fingerprint: string,
+): Promise<RuleHistoryResponse> {
+  return getJson<RuleHistoryResponse>(
+    `/api/rules/${encodeURIComponent(fingerprint)}`,
+  )
+}
+
+/** GET /api/audit — the audit trail, latest first, optionally scoped to one
+ * fingerprint (entity = fingerprint_id) and capped by `limit`. */
+export function getAudit(
+  fingerprint?: string,
+  limit?: number,
+): Promise<AuditResponse> {
+  const q = new URLSearchParams()
+  if (fingerprint) q.set('fingerprint', fingerprint)
+  if (limit !== undefined) q.set('limit', String(limit))
+  const qs = q.toString()
+  return getJson<AuditResponse>(`/api/audit${qs ? `?${qs}` : ''}`)
 }
 
 /** GET /api/onboarding/samples — single-fingerprint form (the row object)

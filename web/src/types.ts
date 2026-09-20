@@ -164,6 +164,36 @@ export interface RejectBody {
   reason?: string
 }
 
+/** One audit_log row (gateway SELECT: id, ts, actor, action, entity, detail —
+ * EXACTLY these 6 keys). `action` is the gateway's closed CHECK vocabulary
+ * (samples_split, candidate_created, candidate_failed, rule_approved,
+ * rule_rejected, rule_deactivated, rule_reactivated, reparse_complete) and is
+ * rendered VERBATIM — the string IS the label (same ruling as the validation
+ * checks grid). `detail` is the JSONB payload (object or null); `ts` is an
+ * ISO-8601 string. */
+export interface AuditRow {
+  id: number
+  ts: string
+  actor: string
+  action: string
+  entity: string
+  detail: object | null
+}
+
+/** GET /api/rules/{fp} response — every version of the fingerprint (newest
+ * first) plus its audit trail (entity = fingerprint_id, latest 200). The
+ * page renders `rules`; the embedded audit array is redundant with
+ * GET /api/audit (Task 9 ruling) but part of the response shape. */
+export interface RuleHistoryResponse {
+  rules: RuleRow[]
+  audit: AuditRow[]
+}
+
+/** GET /api/audit?fingerprint=&limit= response. */
+export interface AuditResponse {
+  audit: AuditRow[]
+}
+
 /** GET /api/onboarding/samples?fingerprint=… row — per-fingerprint sample
  * accounting, by_role zero-filled (Task 9 renders the list form). */
 export interface SamplesStatus {

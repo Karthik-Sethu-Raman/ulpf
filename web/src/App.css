@@ -274,11 +274,6 @@ body {
   border-color: var(--border);
 }
 
-.placeholder {
-  color: var(--muted);
-  font-size: 14px;
-}
-
 /* --- review queue candidate cards ---------------------------------------- */
 
 .candidate {
@@ -515,4 +510,80 @@ body {
   .review-actions {
     grid-template-columns: 1fr;
   }
+}
+
+/* --- rules registry (Task 9) ---------------------------------------------
+   The registry reuses .feed-table (borders, sticky header, row hover) plus
+   the badge-* tokens; the additions below only cover what no existing class
+   expresses: the full-width detail row, the timeline/audit lists and the
+   summary row's deactivate button. */
+
+/* the expanded detail spans the whole table row — no row-pointer there */
+.rules-detail-row td,
+.rules-error-row td {
+  cursor: default;
+  background: var(--panel-2);
+}
+
+.rules-detail h3 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 14px 0 6px;
+}
+
+.rules-detail h3:first-child {
+  margin-top: 4px;
+}
+
+/* version timeline: one line per stored version, newest first */
+.version-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.version-timeline li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* audit feed: `ts · actor · action` lines, action strings verbatim */
+.audit-feed {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+  font-size: 13px;
+}
+
+.audit-sep {
+  color: var(--muted);
+}
+
+/* the summary row's only action button */
+.rules-table .deactivate {
+  background: rgba(248, 81, 73, 0.12);
+  border: 1px solid var(--err);
+  border-radius: 6px;
+  color: var(--err);
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.rules-table .deactivate:hover {
+  border-color: var(--text);
+}
+
+.rules-table .deactivate:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
