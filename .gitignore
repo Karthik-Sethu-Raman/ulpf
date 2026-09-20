@@ -22,7 +22,6 @@ ENV/
 
 # Env / secrets
 .env
-deploy/.env
 *.env.local
 
 # OS / editor cruft
@@ -42,14 +41,10 @@ Thumbs.db
 .ollama
 #zip files
 *.zip
-testdata/registered_rules.json
 #references
 references/
 
 # MVP build artifacts
 node_modules/
 web/dist/
-.venv/
-*.egg-info/
-__pycache__/
 .pytest_cache/

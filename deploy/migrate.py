@@ -52,12 +52,16 @@ def main() -> int:
 
         for path in pending:
             print(f"applying {path.name}")
-            with conn.transaction():
-                cur.execute(path.read_text(encoding="utf-8"))
-                cur.execute(
-                    "INSERT INTO schema_migrations (name) VALUES (%s)",
-                    (path.name,),
-                )
+            try:
+                with conn.transaction():
+                    cur.execute(path.read_text(encoding="utf-8"))
+                    cur.execute(
+                        "INSERT INTO schema_migrations (name) VALUES (%s)",
+                        (path.name,),
+                    )
+            except Exception as exc:  # noqa: BLE001 - any per-file failure (SQL, unreadable file) is reported, not a traceback
+                print(f"migration {path.name} failed: {exc}", file=sys.stderr)
+                return 1
             print(f"applied  {path.name}")
     return 0
 
