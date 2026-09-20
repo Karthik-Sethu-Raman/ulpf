@@ -21,6 +21,7 @@ COPY services/onboarding/config.py /app/onboarding/config.py
 COPY services/onboarding/samples.py /app/onboarding/samples.py
 COPY services/onboarding/generate.py /app/onboarding/generate.py
 COPY services/onboarding/store.py /app/onboarding/store.py
+COPY services/onboarding/reparse.py /app/onboarding/reparse.py
 COPY services/onboarding/app.py /app/onboarding/app.py
 
 CMD ["python", "-m", "onboarding.app"]

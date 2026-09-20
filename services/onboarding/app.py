@@ -1,13 +1,14 @@
-# services/onboarding/app.py — the candidate-generation loop (cold path,
-# serial per fingerprint; the hot path is never touched from here).
+# services/onboarding/app.py — entrypoint for BOTH onboarding convergent
+# loops (cold path; the hot path is never touched from here).
 #
-# Per fingerprint: has_active_or_pending guard -> load_samples -> assign_roles
-# -> mark_roles -> audit(samples_split) -> JSON fast-path (ALL prompt lines
-# parse as JSON) or SLM generate_candidate -> validate_candidate -> passed:
-# insert_candidate (audits candidate_created) / failed: record_attempt +
-# audit(candidate_failed). Every DB failure and SLM unreachability is logged
-# and the loop continues — fail-closed posture: onboarding pends, the hot
-# path stays untouched.
+# Candidate loop (run_candidate_loop), per fingerprint: has_active_or_pending
+# guard -> load_samples -> assign_roles -> mark_roles -> audit(samples_split)
+# -> JSON fast-path (ALL prompt lines parse as JSON) or SLM generate_candidate
+# -> validate_candidate -> passed: insert_candidate (audits candidate_created)
+# / failed: record_attempt + audit(candidate_failed). Reparse loop
+# (run_reparse_loop): R11 backlog supersede sweep (services/onboarding/reparse).
+# Every DB failure and SLM unreachability is logged and the loop continues —
+# fail-closed posture: onboarding pends, the hot path stays untouched.
 import logging
 import threading
 
@@ -20,6 +21,7 @@ from onboarding.generate import (
     generate_json_rule,
     is_json_line,
 )
+from onboarding.reparse import run_reparse_loop
 from onboarding.samples import assign_roles
 from onboarding.store import (
     audit,
@@ -147,9 +149,25 @@ def main() -> None:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
     )
     cfg = Config.from_env()
+    # The service runs BOTH convergent loops (controller ruling): candidate
+    # generation + the R11 backlog re-parse, as daemon threads sharing ONE
+    # stop handle. SIGINT lands in this (main) thread, which sets stop and
+    # lets the daemons wind down.
+    stop = threading.Event()
+    loops = [
+        threading.Thread(target=run_candidate_loop, args=(cfg, stop), daemon=True),
+        threading.Thread(target=run_reparse_loop, args=(cfg, stop), daemon=True),
+    ]
+    for loop in loops:
+        loop.start()
     try:
-        run_candidate_loop(cfg, threading.Event())
+        # Timeout-ed joins: a bare join() cannot be interrupted by Ctrl+C on
+        # Windows, so poll liveness instead of blocking forever.
+        while any(loop.is_alive() for loop in loops):
+            for loop in loops:
+                loop.join(0.5)
     except KeyboardInterrupt:
+        stop.set()
         log.info("shutdown requested")
 
 

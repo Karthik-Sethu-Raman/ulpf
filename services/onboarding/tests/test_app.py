@@ -46,3 +46,27 @@ def test_failure_path_records_total_sample_count(monkeypatch):
         ("candidate_failed", "fp_backlog",
          {"error": "validation failed: boom", "samples_seen": 45}),
     ]
+
+
+def test_main_wires_both_convergent_loops(monkeypatch):
+    # Controller ruling: the onboarding service runs BOTH convergent loops
+    # (candidate generation + R11 backlog re-parse) as daemon threads sharing
+    # one stop handle. Both fakes return immediately, so main()'s join loop
+    # drains and returns — no threading harness needed.
+    invoked = []
+
+    def fake_candidate(cfg, stop):
+        invoked.append(("candidate", cfg, stop))
+
+    def fake_reparse(cfg, stop):
+        invoked.append(("reparse", cfg, stop))
+
+    monkeypatch.setattr(app, "run_candidate_loop", fake_candidate)
+    monkeypatch.setattr(app, "run_reparse_loop", fake_reparse)
+
+    app.main()
+
+    assert sorted(name for name, _, _ in invoked) == ["candidate", "reparse"]
+    # One Config and ONE shared threading.Event stop handle across both loops.
+    assert len({id(cfg) for _, cfg, _ in invoked}) == 1
+    assert len({id(stop) for _, _, stop in invoked}) == 1
