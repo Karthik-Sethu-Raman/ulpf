@@ -1,14 +1,24 @@
-// web/src/App.tsx — the M1 Overview page: 4 stat cards, the SSE live feed
-// table, and a raw-traceability drawer. Same-origin /api only (dev: Vite
-// proxy, prod: Caddy) — the gateway ships no CORS, and the dashboard is
-// air-gapped: system fonts, zero external requests.
+// web/src/App.tsx — the three-tab M2 shell: Overview (the M1 dashboard),
+// Review Queue (Task 8 human review loop) and a Rules placeholder (Task 9).
+// Tab state is plain useState — no router (air-gapped dashboard: system
+// fonts, zero external requests). Same-origin /api only (dev: Vite proxy,
+// prod: Caddy) — the gateway ships no CORS.
 import { useCallback, useEffect, useState } from 'react'
 import { getRaw, getStats } from './api'
 import type { EventRow, OcsfEndpoint, RawTrace, Stats } from './types'
 import { useEventStream } from './useEventStream'
+import ReviewQueue from './ReviewQueue'
 import './App.css'
 
 const STATS_REFRESH_MS = 5000
+
+type Tab = 'overview' | 'review' | 'rules'
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: 'overview', label: 'Overview' },
+  { id: 'review', label: 'Review Queue' },
+  { id: 'rules', label: 'Rules' },
+]
 
 /** parsed / (parsed + unparsed + parse_error + quarantined); "—" before any
  * traffic has been seen (divide-by-zero guard). */
@@ -51,23 +61,22 @@ function statCards(stats: Stats | null): StatCard[] {
 }
 
 /** Side drawer: full OCSF document plus the raw line behind the event
- * (fetched by event_id). Fetch is cancelled if the drawer closes first. */
+ * (fetched by event_id; the fetch is aborted via AbortController if the
+ * drawer closes first). */
 function TraceDrawer({ row, onClose }: { row: EventRow; onClose: () => void }) {
   const [trace, setTrace] = useState<RawTrace | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    let cancelled = false
-    getRaw(row.event_id)
-      .then((t) => {
-        if (!cancelled) setTrace(t)
-      })
+    const controller = new AbortController()
+    getRaw(row.event_id, controller.signal)
+      .then((t) => setTrace(t))
       .catch((err: unknown) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err))
+        if (!controller.signal.aborted) {
+          setError(err instanceof Error ? err.message : String(err))
+        }
       })
-    return () => {
-      cancelled = true
-    }
+    return () => controller.abort()
   }, [row.event_id])
 
   useEffect(() => {
@@ -131,7 +140,9 @@ function TraceDrawer({ row, onClose }: { row: EventRow; onClose: () => void }) {
   )
 }
 
-export default function App() {
+/** The M1 Overview page: 4 stat cards, the SSE live-feed table, and the
+ * raw-traceability drawer. Unchanged behavior. */
+function Overview() {
   const [stats, setStats] = useState<Stats | null>(null)
   const [statsError, setStatsError] = useState<string | null>(null)
   const [selected, setSelected] = useState<EventRow | null>(null)
@@ -155,7 +166,7 @@ export default function App() {
   }, [refreshStats])
 
   return (
-    <div className="app">
+    <section aria-label="Overview">
       <header className="topbar">
         <h1>ULPF Overview</h1>
         <span className="muted">live feed · {rows.length} rows shown (cap 200)</span>
@@ -219,6 +230,47 @@ export default function App() {
           onClose={() => setSelected(null)}
         />
       )}
+    </section>
+  )
+}
+
+/** Rules tab placeholder — the Rules management page lands in Task 9. */
+function RulesPlaceholder() {
+  return (
+    <section aria-label="Rules">
+      <header className="topbar">
+        <h1>Rules</h1>
+      </header>
+      <div className="card muted placeholder">
+        Rules management arrives in Task 9 — rule history, audit trail, and
+        manual authoring.
+      </div>
+    </section>
+  )
+}
+
+export default function App() {
+  const [tab, setTab] = useState<Tab>('overview')
+
+  return (
+    <div className="app">
+      <nav className="tabs" role="tablist" aria-label="ULPF sections">
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            role="tab"
+            aria-selected={tab === t.id}
+            className={tab === t.id ? 'tab tab-active' : 'tab'}
+            onClick={() => setTab(t.id)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </nav>
+      {tab === 'overview' && <Overview />}
+      {tab === 'review' && <ReviewQueue />}
+      {tab === 'rules' && <RulesPlaceholder />}
     </div>
   )
 }
