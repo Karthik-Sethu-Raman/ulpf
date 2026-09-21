@@ -205,6 +205,21 @@ class PipelineWorker:
 
         rules = load_active_rules(self.conn)  # refreshed every batch
 
+        # M3 quarantine (R-M3-6, spec §7.2 "mapping disabled, values
+        # preserved"): drop mappings whose OCSF path the drift role
+        # quarantined — parse() then leaves the captured key in unmapped.
+        # Applied once per quarantined rule per batch, not per row: one rule
+        # object is shared by every row of its fingerprint. model_copy
+        # preserves ActiveRule, so rule.id attribution and rule.version ride
+        # along (quarantine never bumps the version — no event_id churn);
+        # the falsy check short-circuits, so an empty quarantine means zero
+        # copies and the M1/M2 hot path is byte-identical.
+        for fp, rule in rules.items():
+            if rule.quarantined_fields:
+                rules[fp] = rule.model_copy(update={
+                    "mappings": [m for m in rule.mappings
+                                 if m.ocsf_path not in set(rule.quarantined_fields)]})
+
         # Sample capture (R17): only fingerprints with NO active rule, capped
         # per fingerprint by what onboarding_samples already holds. One grouped
         # count query for the whole batch; known fingerprints query nothing.
