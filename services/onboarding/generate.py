@@ -65,6 +65,11 @@ class OllamaClient:
             messages=[{"role": "user", "content": prompt}],
             format="json",
             options={"temperature": temperature},
+            # qwen3 emits chain-of-thought before the answer by default; on
+            # the CPU-only target tier that is ~20-40 min per attempt and can
+            # fill the 4096-token context before any JSON exists (live-
+            # verified Task 11). Reasoning buys nothing for rule extraction.
+            think=False,
         )
         return response["message"]["content"]
 

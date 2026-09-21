@@ -3,7 +3,7 @@
 SIH 2026 PS 26156 MVP. Status: M1 walking skeleton complete — the milestone
 exit is `python scripts/smoke.py` (all 5 checks PASS).
 
-- `services/` — collector, pipeline, gateway (+ onboarding, drift in M2/M3)
+- `services/` — collector, pipeline, gateway, onboarding (drift in M3)
 - `libs/ulpf-core` — fingerprinting, parsing, IDs, hash chain (single implementation)
 - `libs/ocsf-schema` — curated OCSF subset schema + validator
 - `web/` — React dashboard
@@ -19,15 +19,35 @@ Oversized input is handled asymmetrically by design: UDP drops just the one
 oversized datagram (each datagram is an independent event), while TCP closes
 the connection — a byte stream has no line boundary to resynchronize to.
 
-## Quickstart (M1)
+## Quickstart
 
 ```bash
-cd deploy && docker compose --profile sim up -d --build
-python scripts/smoke.py          # end-to-end acceptance incl. forced replay
-open http://localhost:3000       # Overview: live feed + raw traceability
-# sustained live traffic for the dashboard (the --profile sim one-shot above
-# exits after its single ~56-line pass):
+cd deploy && docker compose --profile slm-4b up -d --build
+```
+
+Brings up the M1 pipeline plus the M2 onboarding loop and the default SLM
+tier: `qwen3:4b` behind the `ollama-4b` sidecar (runs on 8GB boxes; the model
+is pulled by the sidecar on first start — a one-time multi-GB download).
+16GB boxes may upgrade: `--profile slm-8b` plus `ULPF_OLLAMA_URL=http://ollama-8b:11434`
+and `ULPF_OLLAMA_MODEL=qwen3:8b` in `deploy/.env` (see `.env.example`). The
+ollama sidecars publish **no host port** — they are reachable only inside the
+compose network (the onboarding service is their only client).
+
+Hero loop (unknown appliance → candidate rule): play the unknown `newapp`
+corpus at the collector, then watch the Review Queue while onboarding splits
+samples, asks the SLM, validates, and stores the candidate as `pending_review`:
+
+```bash
+docker compose --profile sim run --rm simulator --eps 25 --duration 20 --mode new-appliance
+open http://localhost:3000        # Review Queue: the newapp fingerprint lands as pending_review
+# sustained live traffic for the dashboard (run re-activates the sim profile):
 docker compose run --rm simulator --eps 20 --duration 300 --loop
+```
+
+M1 acceptance gate (does not need a profile; it starts the base stack itself):
+
+```bash
+python scripts/smoke.py          # end-to-end acceptance incl. forced replay
 ```
 
 The smoke runs the simulator over the golden corpora, then verifies: lossless
