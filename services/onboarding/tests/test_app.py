@@ -25,7 +25,6 @@ def test_failure_path_records_total_sample_count(monkeypatch):
         return FakeStoreConn()
 
     def fake_count_samples(conn, fp):
-        seen["count_conn"] = conn
         return 45  # TOTAL rows: e.g. 30 piled up while the SLM was down
 
     def fake_record_attempt(conn, fp, samples_seen, error):

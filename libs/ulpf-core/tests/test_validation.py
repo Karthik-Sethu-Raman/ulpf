@@ -153,7 +153,7 @@ def test_hardcoded_literals_common_values_not_flagged():
     generic = kv_rule()
     assert find_hardcoded_literals(generic.pattern, same_ts) == []
     pinned = r"^ACMEGW fw01 \S+ (?:DROP|ACCEPT)\s+(?P<extension>.*)$"
-    assert "fw01" in find_hardcoded_literals(pinned, same_ts)
+    assert find_hardcoded_literals(pinned, same_ts) == ["fw01"]
 
 def test_candidate_report_is_frozen_dataclass():
     report = validate_candidate(kv_rule(), ACME[:1], ACME[1:])

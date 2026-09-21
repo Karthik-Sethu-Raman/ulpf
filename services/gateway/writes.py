@@ -159,13 +159,15 @@ def _run_candidate_insert(op, conn, /, *args):
     violations are not retried pointlessly."""
     import psycopg
 
+    last_exc: psycopg.IntegrityError | None = None
     for attempt in (1, 2):
         try:
             return _execute(op, conn, *args)
         except psycopg.IntegrityError as exc:
+            last_exc = exc  # kept: `as exc` is deleted at except-block exit
             log.warning("rules INSERT integrity error (attempt %d/2): %s",
                         attempt, exc)
-    raise ConflictError(_CONFLICT_MSG)
+    raise ConflictError(_CONFLICT_MSG) from last_exc
 
 
 def _audit(cur, action: str, entity: str, detail: dict, *, actor: str) -> None:

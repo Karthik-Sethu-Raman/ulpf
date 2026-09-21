@@ -39,6 +39,11 @@ numerator). Split: 5 prompt / up to 15 held-out per corpus.
 | zenwall | 1    | 0     | 100.0%     | 100.0%   | n/a            | 3.0           | n/a    |
 | newapp  | 1    | 0     | 100.0%     | 100.0%   | n/a            | 3.0           | n/a    |
 
+Note: s/rule values in this recorded run exclude validation time — the
+tool's timing window closed before validation ran (corrected after the run;
+validation is sub-second regex work over ≤15 lines, and future runs include
+it).
+
 acmegw failures:
 - 3 attempts: Failed to generate a valid rule for fingerprint 'sanity-eval' after 3 attempts. Last error: Generated rule yielded 0.0 confidence. It failed to match the samples. Try a simpler regex.
 

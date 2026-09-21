@@ -13,6 +13,7 @@ brainstorm (2026-09-19) are recorded here because they bind later milestones.
 GRANT SELECT, INSERT ON rules TO rules_role;
 GRANT UPDATE (status, activated_at, deactivated_at) ON rules TO rules_role;
 GRANT INSERT ON audit_log TO rules_role;
+GRANT SELECT ON onboarding_samples TO rules_role;
 
 -- onboarding service (candidate generation + backlog re-parse, R11)
 GRANT SELECT, INSERT ON rules TO onboarding_role;
@@ -20,6 +21,7 @@ GRANT INSERT ON audit_log TO onboarding_role;
 GRANT SELECT, UPDATE (role) ON onboarding_samples TO onboarding_role;
 GRANT SELECT ON raw_events TO onboarding_role;
 GRANT INSERT, SELECT, UPDATE (superseded_by_event_id) ON normalized_events TO onboarding_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON onboarding_attempts TO onboarding_role;
 ```
 
 Completion note (migration `006_rules_sequence_grants.sql`): 003 granted the

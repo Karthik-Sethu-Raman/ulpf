@@ -41,6 +41,31 @@ def test_num():
     assert sanity_eval.num(None) == "n/a"
 
 
+# ---------- row assembly (rate denominators per the documented metrics) ----------
+
+def test_row_compiles_rate_denominator_is_valid_json():
+    # Documented metric: compiles is "of those" — the valid-JSON responses —
+    # not of all responses. 1 compiles out of 1 valid JSON (3 total responses)
+    # is a 100% compiles rate, even though valid_json is 33.3%.
+    result = {"corpus": "fake", "runs": 1, "rules_stored": 1, "responses": 3,
+              "valid_json": 1, "compiles": 1, "held_out_match_rate": 1.0,
+              "mean_attempts": 3.0, "sec_per_rule": 1.5}
+    row = sanity_eval._row(result)
+    assert row[3] == "33.3%"   # valid_json / responses
+    assert row[4] == "100.0%"  # compiles / valid_json
+
+
+def test_row_compiles_rate_na_when_no_valid_json():
+    # Zero-division guard: with no valid-JSON responses the compiles rate has
+    # no denominator and renders like any other missing value.
+    result = {"corpus": "fake", "runs": 1, "rules_stored": 0, "responses": 2,
+              "valid_json": 0, "compiles": 0, "held_out_match_rate": None,
+              "mean_attempts": 2.0, "sec_per_rule": None}
+    row = sanity_eval._row(result)
+    assert row[3] == "0.0%"
+    assert row[4] == "n/a"
+
+
 # ---------- corpus resolution ----------
 
 def test_find_corpora_prefers_first_dir_with_the_file(tmp_path):
@@ -109,6 +134,24 @@ def test_evaluate_corpus_counts_failed_attempts():
     assert result["valid_json"] == 1
     assert result["mean_attempts"] == 3.0
     assert result["rules_stored"] == 1
+
+
+def test_sec_per_rule_includes_validation_time(monkeypatch):
+    # Documented metric: s/rule is "generation + validation, failed runs
+    # included" — the timing window must stay open through validate_candidate,
+    # not close the moment generate_candidate returns. The fake gate sleeps
+    # 50ms per run; with the window closed early sec_per_rule would be ~0.
+    import types
+
+    def slow_validate(rule, prompt_lines, held_out_lines):
+        time.sleep(0.05)
+        return types.SimpleNamespace(held_out_match_rate=1.0)
+
+    monkeypatch.setattr(sanity_eval, "validate_candidate", slow_validate)
+    result = sanity_eval.evaluate_corpus(
+        "fake", LINES, client_factory=lambda: FakeClient(GOOD_RULE), runs=1)
+    assert result["rules_stored"] == 1
+    assert result["sec_per_rule"] >= 0.05
 
 
 # ---------- doc assembly ----------

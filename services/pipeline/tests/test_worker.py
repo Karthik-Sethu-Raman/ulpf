@@ -241,6 +241,13 @@ def test_every_event_produced_as_envelope_keyed_by_fingerprint(monkeypatch):
 
     envelopes = {k: v for t, k, v in producer.produced if t == "normalized.events"}
     assert set(envelopes) == {fp_parsed, fp_error, fp_unparsed}
+    # Produced-tuple COUNT per topic (the dict above dedupes by key, which
+    # would hide a double-production bug): one envelope per event, and the
+    # DLQ carries exactly the one parse_error.
+    produced_by_topic: dict[str, int] = {}
+    for topic, _, _ in producer.produced:
+        produced_by_topic[topic] = produced_by_topic.get(topic, 0) + 1
+    assert produced_by_topic == {"normalized.events": 3, "pipeline.dlq": 1}
     expected = {
         fp_parsed: EventEnvelope(
             event_id=str(event_id_for(raw_id_for("raw.logs", 0, 1), 3)),

@@ -123,6 +123,21 @@ def test_generate_candidate_without_lines_raises_generation_error():
         generate_candidate("fp_x", [], FakeSLM([_VALID]))
 
 
+def test_generate_candidate_ladder_on_sentinel_zero_mappings():
+    # T5-M2 through the SLM ladder: a valid-JSON response carrying the
+    # __JSON__ sentinel but ZERO field mappings is the same vacuity as the
+    # fast path's — fed back through the escalating-temperature ladder, and
+    # when every attempt fails the same way the outcome is GenerationError.
+    zero_map = json.dumps({"pattern": JSON_SENTINEL, "field_mappings": []})
+    fake = FakeSLM([zero_map, zero_map, zero_map])
+    with pytest.raises(GenerationError, match="zero field mappings"):
+        generate_candidate("fp_x", _SAMPLES, fake, max_attempts=3)
+
+    assert [t for _, t in fake.calls] == pytest.approx([0.1, 0.3, 0.5])
+    # The retry prompt carries the previous attempt's failure (feedback loop).
+    assert "zero field mappings" in fake.calls[1][0]
+
+
 def test_generate_json_rule_maps_aliases_and_sets_sentinel():
     lines = [
         ('{"src_ip": "10.0.0.1", "dst_ip": "10.0.0.2", "src_port": 443, '

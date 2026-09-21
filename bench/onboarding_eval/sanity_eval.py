@@ -195,11 +195,13 @@ def evaluate_corpus(corpus: str, lines: list[str], *, client_factory,
         try:
             rule = generate_candidate("sanity-eval", prompt_lines, client)
         except GenerationError as exc:
-            wall += time.monotonic() - start
+            wall += time.monotonic() - start  # failed run: generation only
             failures.append(f"{len(client.calls)} attempts: {exc}")
         else:
-            wall += time.monotonic() - start
             report = validate_candidate(rule, prompt_lines, held_out_lines)
+            # Window stays open through validation: s/rule is documented as
+            # "generation + validation, failed runs included".
+            wall += time.monotonic() - start
             rules_stored += 1
             match_rates.append(report.held_out_match_rate)
 
@@ -231,12 +233,14 @@ def evaluate_corpus(corpus: str, lines: list[str], *, client_factory,
 
 def _row(result: dict) -> list[str]:
     responses = result["responses"] or None
+    valid_json = result["valid_json"] or None
     return [
         result["corpus"],
         str(result["runs"]),
         str(result["rules_stored"]),
         pct(result["valid_json"] / responses if responses else None),
-        pct(result["compiles"] / responses if responses else None),
+        # Documented denominator: "of those" — the valid-JSON responses.
+        pct(result["compiles"] / valid_json if valid_json else None),
         pct(result["held_out_match_rate"]),
         num(result["mean_attempts"]),
         num(result["sec_per_rule"]),
