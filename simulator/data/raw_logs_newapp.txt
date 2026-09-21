@@ -1,0 +1,12 @@
+NEXUSFW-XE7 flowgate ts=2026-09-19T10:00:03Z src=198.51.100.4 srcport=52114 dst=203.0.113.9 dstport=8443 proto=TCP action=permit msg=Tunnel established sessionid=88123
+NEXUSFW-XE7 flowgate ts=2026-09-19T10:00:07Z src=198.51.100.9 srcport=49300 dst=203.0.113.4 dstport=443 proto=TCP action=deny msg=Blocked unauthorized relay sessionid=88124
+NEXUSFW-XE7 flowgate ts=2026-09-19T10:00:12Z src=198.51.100.23 srcport=40017 dst=203.0.113.77 dstport=22 proto=TCP action=deny msg=Login attempt rejected by policy sessionid=88125
+NEXUSFW-XE7 flowgate ts=2026-09-19T10:00:19Z src=198.51.100.55 srcport=61002 dst=203.0.113.12 dstport=53 proto=UDP action=permit msg=Recursive lookup granted sessionid=88126
+NEXUSFW-XE7 flowgate ts=2026-09-19T10:00:25Z src=198.51.100.77 srcport=51190 dst=203.0.113.200 dstport=8080 proto=TCP action=permit msg=Proxy session opened sessionid=88127
+NEXUSFW-XE7 flowgate ts=2026-09-19T10:00:31Z src=198.51.100.104 srcport=44521 dst=203.0.113.58 dstport=445 proto=TCP action=deny msg=SMB relay blocked sessionid=88128
+NEXUSFW-XE7 flowgate ts=2026-09-19T10:00:38Z src=198.51.100.140 srcport=52330 dst=203.0.113.3 dstport=123 proto=UDP action=permit msg=Time sync sessionid=88129
+NEXUSFW-XE7 flowgate ts=2026-09-19T10:00:44Z src=198.51.100.201 srcport=49155 dst=203.0.113.150 dstport=3389 proto=TCP action=deny msg=RDP gateway probe dropped sessionid=88130
+NEXUSFW-XE7 flowgate ts=2026-09-19T10:00:51Z src=198.51.100.16 srcport=50210 dst=203.0.113.90 dstport=514 proto=TCP action=permit msg=Log forwarder attached sessionid=88131
+NEXUSFW-XE7 flowgate ts=2026-09-19T10:00:58Z src=198.51.100.66 srcport=48002 dst=203.0.113.44 dstport=161 proto=UDP action=deny msg=SNMP community mismatch sessionid=88132
+NEXUSFW-XE7 flowgate ts=2026-09-19T10:01:04Z src=198.51.100.90 srcport=53001 dst=203.0.113.230 dstport=9200 proto=TCP action=permit msg=Indexer feeder accepted sessionid=88133
+NEXUSFW-XE7 flowgate ts=2026-09-19T10:01:10Z src=198.51.100.120 srcport=44417 dst=203.0.113.19 dstport=1521 proto=TCP action=deny msg=Database listener refused sessionid=88134

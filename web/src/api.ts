@@ -1,19 +1,58 @@
 // web/src/api.ts — thin fetch wrappers over the same-origin /api gateway
-// (services/gateway, Task 9). Every wrapper throws on non-2xx so callers get
-// a real error instead of a resolved promise with an error body.
+// (services/gateway). Every wrapper throws on non-2xx so callers get a real
+// error instead of a resolved promise with an error body. POST failures carry
+// the FastAPI `detail` payload (string for 409s; {checks, notes} for 422
+// validation failures) so the Review Queue can render the gate's verdict.
 //
-// getEvents is part of the client surface mirroring the gateway (status /
-// fingerprint filters arrive in M2); the Overview page itself is fed by the
-// SSE stream, which already snapshots the latest rows on connect.
-import type { EventsResponse, RawTrace, Stats } from './types'
+// The Overview page is fed by the SSE stream; getRules/getSamples serve the
+// M2 review surfaces (Tasks 8/9), mirroring the gateway endpoint shapes.
+import type {
+  AuditResponse,
+  EventsResponse,
+  RawTrace,
+  RuleHistoryResponse,
+  RulesResponse,
+  SamplesListResponse,
+  SamplesStatus,
+  Stats,
+} from './types'
 
-async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url)
+async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(url, { signal })
   if (!res.ok) {
     throw new Error(`GET ${url} failed: ${res.status} ${res.statusText}`)
   }
   return (await res.json()) as T
 }
+
+/** Format a non-2xx response body's `detail` for display: strings pass
+ * through (409/404), objects are JSON-encoded (422 carries {checks, notes}). */
+async function detailText(res: Response): Promise<string> {
+  try {
+    const body = (await res.json()) as { detail?: unknown }
+    const d = body?.detail
+    if (typeof d === 'string') return d
+    if (d !== undefined) return JSON.stringify(d)
+  } catch {
+    /* body was not JSON — fall through to status text */
+  }
+  return `${res.status} ${res.statusText}`
+}
+
+async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  })
+  if (!res.ok) {
+    throw new Error(`POST ${url} failed: ${await detailText(res)}`)
+  }
+  return (await res.json()) as T
+}
+
+export { postJson }
 
 export function getStats(): Promise<Stats> {
   return getJson<Stats>('/api/stats')
@@ -36,6 +75,56 @@ export function getEvents(params: EventQuery = {}): Promise<EventsResponse> {
   return getJson<EventsResponse>(`/api/events${qs ? `?${qs}` : ''}`)
 }
 
-export function getRaw(eventId: string): Promise<RawTrace> {
-  return getJson<RawTrace>(`/api/events/${encodeURIComponent(eventId)}/raw`)
+export function getRaw(eventId: string, signal?: AbortSignal): Promise<RawTrace> {
+  return getJson<RawTrace>(
+    `/api/events/${encodeURIComponent(eventId)}/raw`,
+    signal,
+  )
+}
+
+// --- M2 review surfaces (Task 7 endpoints; consumed by Tasks 8/9) ------------
+
+export function getRules(params: { status?: string } = {}): Promise<RulesResponse> {
+  const q = new URLSearchParams()
+  if (params.status) q.set('status', params.status)
+  const qs = q.toString()
+  return getJson<RulesResponse>(`/api/rules${qs ? `?${qs}` : ''}`)
+}
+
+/** GET /api/rules/{fp} — every version of the fingerprint (newest first)
+ * plus its audit trail (entity = fingerprint_id, latest 200). The Rules page
+ * renders `rules` and takes its feed from getAudit instead: the embedded
+ * `audit` array is redundant (Task 9 ruling) but part of the shape. */
+export function getRuleHistory(
+  fingerprint: string,
+): Promise<RuleHistoryResponse> {
+  return getJson<RuleHistoryResponse>(
+    `/api/rules/${encodeURIComponent(fingerprint)}`,
+  )
+}
+
+/** GET /api/audit — the audit trail, latest first, optionally scoped to one
+ * fingerprint (entity = fingerprint_id) and capped by `limit`. */
+export function getAudit(
+  fingerprint?: string,
+  limit?: number,
+): Promise<AuditResponse> {
+  const q = new URLSearchParams()
+  if (fingerprint) q.set('fingerprint', fingerprint)
+  if (limit !== undefined) q.set('limit', String(limit))
+  const qs = q.toString()
+  return getJson<AuditResponse>(`/api/audit${qs ? `?${qs}` : ''}`)
+}
+
+/** GET /api/onboarding/samples — single-fingerprint form (the row object)
+ * when a fingerprint is given, the {samples: [...]} list form otherwise. */
+export function getSamples(
+  fingerprint?: string,
+): Promise<SamplesStatus | SamplesListResponse> {
+  const qs = fingerprint
+    ? `?fingerprint=${encodeURIComponent(fingerprint)}`
+    : ''
+  return getJson<SamplesStatus | SamplesListResponse>(
+    `/api/onboarding/samples${qs}`,
+  )
 }

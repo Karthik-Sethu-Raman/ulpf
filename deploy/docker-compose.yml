@@ -54,6 +54,9 @@ services:
     build: { context: .., dockerfile: services/gateway/Dockerfile }
     environment:
       DATABASE_URL: postgresql://gateway_role:gateway_dev@postgres:5432/ulpf
+      # M2 write path (Task 7): lifecycle mutations as the least-privilege
+      # rules_role; reads keep the read-only gateway_role DSN above.
+      WRITE_DATABASE_URL: postgresql://rules_role:rules_dev@postgres:5432/ulpf
     ports: ["8000:8000"]
     depends_on: { migrate: { condition: service_completed_successfully } }
   web:
@@ -65,4 +68,37 @@ services:
     build: { context: .., dockerfile: simulator/Dockerfile }
     environment: { COLLECTOR_UDP: collector:5514, COLLECTOR_HTTP: http://collector:8080 }
     depends_on: [ collector ]
-volumes: { pgdata: {} }
+  # M2 onboarding (cold path): polls onboarding_samples, splits 5/15, asks the
+  # SLM for a candidate rule, validates it, stores it as pending_review. The
+  # SLM tier is picked by profile: --profile slm-4b (default, 8GB boxes) or
+  # --profile slm-8b (16GB) + ULPF_OLLAMA_URL/ULPF_OLLAMA_MODEL in deploy/.env
+  # pointing at ollama-8b. Fail-closed: with no SLM reachable the loop logs
+  # and retries — the hot path is never touched.
+  onboarding:
+    build: { context: .., dockerfile: services/onboarding/Dockerfile }
+    environment:
+      DATABASE_URL: postgresql://onboarding_role:onboarding_dev@postgres:5432/ulpf
+      OLLAMA_URL: ${ULPF_OLLAMA_URL:-http://ollama-4b:11434}
+      OLLAMA_MODEL: ${ULPF_OLLAMA_MODEL:-qwen3:4b}
+    restart: unless-stopped
+    depends_on: { migrate: { condition: service_completed_successfully } }
+  # Ollama sidecars. No host port by design: only the onboarding service talks
+  # to them, inside the compose network. The entrypoint serves, then blocks on
+  # `ollama pull` until the tier's model is local, then waits on serve.
+  ollama-4b:
+    image: ollama/ollama:0.34.2
+    profiles: [ slm-4b ]
+    entrypoint: [ "/bin/sh", "/entrypoint.sh" ]
+    environment: { MODEL: "qwen3:4b" }
+    volumes:
+      - ollama4:/root/.ollama
+      - ./ollama-entrypoint.sh:/entrypoint.sh:ro
+  ollama-8b:
+    image: ollama/ollama:0.34.2
+    profiles: [ slm-8b ]
+    entrypoint: [ "/bin/sh", "/entrypoint.sh" ]
+    environment: { MODEL: "qwen3:8b" }
+    volumes:
+      - ollama8:/root/.ollama
+      - ./ollama-entrypoint.sh:/entrypoint.sh:ro
+volumes: { pgdata: {}, ollama4: {}, ollama8: {} }

@@ -8,10 +8,14 @@
 # raw_batches honestly records the re-delivery (Task 12 Assert D).
 #
 # psycopg is imported lazily inside the persist functions only, so unit tests
-# exercise build_rows()/the dataclasses without psycopg installed (mirrors the
-# collector's deferred confluent_kafka import). persist_* commit on success and
-# leave the transaction aborted on failure — the worker rolls back and does NOT
-# commit offsets, so failed batches are redelivered (at-least-once).
+# exercise build_rows()/collect_samples() without psycopg installed (mirrors
+# the collector's deferred confluent_kafka import). Connections run
+# AUTOCOMMIT (T7): each persist_* wraps its work in exactly one
+# `with conn.transaction():` block — the context manager commits on exit,
+# rolls back on failure, and nothing idles inside an open transaction between
+# batches. A failure propagates to the worker, which rolls back, seeks back
+# and does NOT commit offsets, so failed batches are redelivered
+# (at-least-once).
 from __future__ import annotations
 
 import dataclasses
@@ -80,6 +84,16 @@ class NormalizedRow:
     ocsf: dict | None
 
 
+@dataclass(frozen=True)
+class SampleRow:
+    """One onboarding_samples row; captured_at/role default in the table
+    ('unused' until the M2 onboarding split promotes it)."""
+
+    fingerprint_id: str
+    raw_id: uuid.UUID
+    raw_text: str
+
+
 def build_rows(msgs) -> tuple[list[RawRow], dict[int, PartitionMeta]]:
     """Assemble RawRows + per-partition PartitionMeta from Kafka messages.
 
@@ -125,6 +139,44 @@ def build_rows(msgs) -> tuple[list[RawRow], dict[int, PartitionMeta]]:
     return rows, parts
 
 
+def collect_samples(rows: list[RawRow], active_rules: dict,
+                    existing_counts: dict[str, int], cap: int = 200) -> list[SampleRow]:
+    """Sample capture (R17): raw lines for fingerprints with NO active rule,
+    at most `cap` per fingerprint counting what onboarding_samples already
+    holds (existing_counts, from sample_counts) plus what this call takes.
+
+    Pure: no connection, no psycopg — the SQL lives in sample_counts() and
+    persist_normalized(); this only applies the capture policy.
+    """
+    samples: list[SampleRow] = []
+    taken: dict[str, int] = {}
+    for row in rows:
+        fp = row.fingerprint_id
+        if fp in active_rules:
+            continue
+        if existing_counts.get(fp, 0) + taken.get(fp, 0) >= cap:
+            continue
+        taken[fp] = taken.get(fp, 0) + 1
+        samples.append(SampleRow(fp, row.raw_id, row.raw_text))
+    return samples
+
+
+def sample_counts(conn: psycopg.Connection,
+                  fingerprint_ids: list[str]) -> dict[str, int]:
+    """Existing onboarding_samples counts for this batch's rule-less
+    fingerprints — one grouped query for the whole batch (R17), so capture
+    caps against what earlier batches already stored."""
+    if not fingerprint_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT fingerprint_id, count(*) FROM onboarding_samples "
+            "WHERE fingerprint_id = ANY(%s) GROUP BY fingerprint_id",
+            (fingerprint_ids,),
+        )
+        return {fp: count for fp, count in cur.fetchall()}
+
+
 def persist_batch(conn: psycopg.Connection, rows: list[RawRow],
                   partitions: dict[int, PartitionMeta]) -> None:
     """Insert raw rows idempotently + append the per-partition chain, ONE txn.
@@ -134,14 +186,15 @@ def persist_batch(conn: psycopg.Connection, rows: list[RawRow],
     one consumer per partition, spec §4), prev_hash = prior batch's merkle_root
     (GENESIS_PREV_HASH for the first), row_hashes = the batch's ordered
     content_hash list, and merkle_root computed from exactly that list.
-    Commits on success; on failure the caller rolls back and skips the offset
-    commit so Kafka redelivers the batch.
+    The `with conn.transaction():` block commits on success and rolls back on
+    failure; the exception still propagates so the caller seeks back and skips
+    the offset commit, and Kafka redelivers the batch.
     """
     if not partitions:
         return
     from psycopg.types.json import Json  # deferred: keeps psycopg off the test path
 
-    with conn.cursor() as cur:
+    with conn.transaction(), conn.cursor() as cur:
         cur.execute("CREATE TEMP TABLE staging_raw (LIKE raw_events INCLUDING DEFAULTS) ON COMMIT DROP")
         with cur.copy(
             f"COPY staging_raw ({', '.join(_RAW_COLUMNS)}) FROM STDIN"
@@ -177,18 +230,22 @@ def persist_batch(conn: psycopg.Connection, rows: list[RawRow],
                     meta.first_offset, meta.last_offset,
                 ),
             )
-    conn.commit()
     log.info("raw batch persisted: %d row(s) across %d partition(s)", len(rows), len(partitions))
 
 
-def persist_normalized(conn: psycopg.Connection, events: list[NormalizedRow]) -> None:
+def persist_normalized(conn: psycopg.Connection, events: list[NormalizedRow],
+                       samples: list[SampleRow] | None = None) -> None:
     """Insert normalized rows idempotently (staged ON CONFLICT on
-    (event_id, parsed_at)), ONE txn; commits on success.
+    (event_id, parsed_at)) and — in the SAME transaction — capture onboarding
+    samples (INSERT .. ON CONFLICT (raw_id) DO NOTHING: replay-safe, one raw
+    line -> at most one sample, migration 003); ONE `conn.transaction()` block
+    commits on success.
 
-    The FK to raw_events holds because persist_batch already committed the raw
-    rows; a replay collides on the PK and is skipped (spec §4 idempotency).
+    The raw rows were committed by persist_batch earlier in the same batch, so
+    the normalized FK target is durable; a replay collides on the PK and is
+    skipped (spec §4 idempotency).
     """
-    if not events:
+    if not events and not samples:
         return
     from psycopg.types.json import Json  # deferred: keeps psycopg off the test path
 
@@ -196,7 +253,7 @@ def persist_normalized(conn: psycopg.Connection, events: list[NormalizedRow]) ->
         "event_id", "raw_id", "raw_received_at", "parsed_at", "fingerprint_id",
         "rule_id", "rule_version", "status", "ocsf",
     )
-    with conn.cursor() as cur:
+    with conn.transaction(), conn.cursor() as cur:
         cur.execute("CREATE TEMP TABLE staging_ne (LIKE normalized_events INCLUDING DEFAULTS) ON COMMIT DROP")
         with cur.copy(f"COPY staging_ne ({', '.join(columns)}) FROM STDIN") as copy:
             for ev in events:
@@ -210,5 +267,11 @@ def persist_normalized(conn: psycopg.Connection, events: list[NormalizedRow]) ->
             f"SELECT {', '.join(columns)} FROM staging_ne "
             "ON CONFLICT (event_id, parsed_at) DO NOTHING"
         )
-    conn.commit()
-    log.info("normalized batch persisted: %d row(s)", len(events))
+        if samples:
+            cur.executemany(
+                "INSERT INTO onboarding_samples (fingerprint_id, raw_id, raw_text) "
+                "VALUES (%s, %s, %s) ON CONFLICT (raw_id) DO NOTHING",
+                [(s.fingerprint_id, s.raw_id, s.raw_text) for s in samples],
+            )
+    log.info("normalized batch persisted: %d row(s), %d sample(s)",
+             len(events), len(samples or []))

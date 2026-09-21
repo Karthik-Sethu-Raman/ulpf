@@ -29,6 +29,25 @@ def test_http_rejects_oversized_line(client):
     r = c.post("/v1/ingest", json={"source_id": "x", "lines": ["y" * 70000]})
     assert r.status_code == 422
 
+def test_http_rejects_more_than_1000_lines(client):
+    c, _prod = client
+    r = c.post("/v1/ingest", json={"source_id": "x", "lines": ["ok"] * 1001})
+    assert r.status_code == 422
+
+def test_http_accepts_1000_lines_and_64_char_format_hint(client):
+    # Boundary: the caps themselves are accepted (IngestRequest Field limits).
+    c, prod = client
+    r = c.post("/v1/ingest", json={"source_id": "x", "lines": ["a"] * 1000,
+                                   "format_hint": "f" * 64})
+    assert r.status_code == 202 and r.json() == {"accepted": 1000}
+    assert prod.produced[0]["format_hint"] == "f" * 64
+
+def test_http_rejects_oversized_format_hint(client):
+    c, _prod = client
+    r = c.post("/v1/ingest", json={"source_id": "x", "lines": ["ok"],
+                                   "format_hint": "f" * 65})
+    assert r.status_code == 422
+
 def test_syslog_handler_wraps_datagram():
     from collector.app import make_envelope
     env = make_envelope("syslog-udp", "fw01", "Aug 27 14:32:07 fw01 kernel: X")

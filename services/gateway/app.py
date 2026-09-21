@@ -19,8 +19,9 @@ from datetime import datetime
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
-from gateway import queries
+from gateway import queries, writes
 
 log = logging.getLogger("gateway")
 
@@ -65,10 +66,57 @@ async def sse_events(queries_module, poll_seconds, heartbeat_seconds, max_polls)
         await asyncio.sleep(poll_seconds)
 
 
-def build_app(queries_module=queries, poll_seconds=SSE_POLL_SECONDS,
-              heartbeat_seconds=SSE_HEARTBEAT_SECONDS, max_polls=None):
-    """FastAPI app factory; the queries module is injected (tests monkeypatch
-    gateway.queries attributes — routes resolve them at request time)."""
+# --- M2 write path + review surfaces (Task 7; additive to the frozen M1 API) --
+# Request bodies (actor defaults to "anonymous" — no auth in MVP).
+
+class MappingBody(BaseModel):
+    source_field: str
+    ocsf_path: str
+
+
+class OverrideBody(BaseModel):
+    pattern: str
+    mappings: list[MappingBody]
+
+
+class ApproveBody(BaseModel):
+    actor: str = "anonymous"
+    reason: str | None = None
+    edited_mappings: list[MappingBody] | None = None
+    override: OverrideBody | None = None
+
+
+class RejectBody(BaseModel):
+    actor: str = "anonymous"
+    reason: str | None = None
+
+
+class ManualBody(BaseModel):
+    fingerprint_id: str
+    pattern: str
+    mappings: list[MappingBody]
+    actor: str = "anonymous"
+    confidence: float | None = None
+
+
+def _write_http_error(exc: writes.WriteError) -> HTTPException:
+    """writes.* typed errors -> the API contract: 404 unknown, 409 conflict,
+    422 failed validation carrying the gate's checks + notes (the Review UI
+    renders them)."""
+    if isinstance(exc, writes.ValidationError):
+        return HTTPException(status_code=422,
+                             detail={"checks": exc.checks, "notes": exc.notes})
+    if isinstance(exc, writes.ConflictError):
+        return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=404, detail=str(exc))  # NotFoundError
+
+
+def build_app(queries_module=queries, writes_module=writes,
+              poll_seconds=SSE_POLL_SECONDS, heartbeat_seconds=SSE_HEARTBEAT_SECONDS,
+              max_polls=None):
+    """FastAPI app factory; the queries/writes modules are injected (tests
+    monkeypatch gateway.queries / gateway.writes attributes — routes resolve
+    them at request time)."""
 
     app = FastAPI(title="ulpf-gateway", version="0.1.0")
 
@@ -106,6 +154,88 @@ def build_app(queries_module=queries, poll_seconds=SSE_POLL_SECONDS,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    # ---------- M2: rules, samples status, audit; rule lifecycle ----------
+
+    @app.get("/api/rules")
+    async def list_rules(status: str | None = None):
+        return {"rules": await asyncio.to_thread(queries_module.fetch_rules, status)}
+
+    @app.get("/api/rules/{fingerprint_id}")
+    async def rule_history(fingerprint_id: str):
+        return await asyncio.to_thread(
+            queries_module.fetch_rule_history, fingerprint_id)
+
+    @app.get("/api/onboarding/samples")
+    async def samples_status(fingerprint: str | None = None):
+        rows = await asyncio.to_thread(queries_module.fetch_samples_status, fingerprint)
+        if fingerprint is not None:
+            return rows[0]  # single-fingerprint form; fetch_* zero-fills unknown fps
+        return {"samples": rows}
+
+    @app.get("/api/audit")
+    async def audit_trail(
+        fingerprint: str | None = None,
+        limit: int = Query(default=queries.DEFAULT_LIMIT, ge=1, le=queries.MAX_LIMIT),
+    ):
+        return {"audit": await asyncio.to_thread(
+            queries_module.fetch_audit, fingerprint, limit)}
+
+    @app.post("/api/rules/manual", status_code=201)
+    async def create_manual(body: ManualBody):
+        # Two-step manual authoring: this stores a validated pending_review
+        # candidate; a human approves it through the SAME endpoint as SLM
+        # candidates (one activation path, uniform audit).
+        try:
+            return await asyncio.to_thread(
+                writes_module.create_manual_candidate, body.fingerprint_id,
+                body.pattern, [m.model_dump() for m in body.mappings],
+                actor=body.actor, confidence=body.confidence)
+        except writes.WriteError as exc:
+            raise _write_http_error(exc) from exc
+
+    @app.post("/api/rules/{fingerprint_id}/candidates/{candidate_id}/approve")
+    async def approve(fingerprint_id: str, candidate_id: int, body: ApproveBody):
+        try:
+            return await asyncio.to_thread(
+                writes_module.approve_candidate, fingerprint_id, candidate_id,
+                actor=body.actor, reason=body.reason,
+                edited_mappings=None if body.edited_mappings is None
+                else [m.model_dump() for m in body.edited_mappings],
+                override=None if body.override is None else body.override.model_dump())
+        except writes.WriteError as exc:
+            raise _write_http_error(exc) from exc
+
+    @app.post("/api/rules/{fingerprint_id}/candidates/{candidate_id}/reject")
+    async def reject(fingerprint_id: str, candidate_id: int,
+                     body: RejectBody | None = None):
+        body = body or RejectBody()  # actor/reason are optional in the contract
+        try:
+            return await asyncio.to_thread(
+                writes_module.reject_candidate, fingerprint_id, candidate_id,
+                actor=body.actor, reason=body.reason)
+        except writes.WriteError as exc:
+            raise _write_http_error(exc) from exc
+
+    @app.post("/api/rules/{fingerprint_id}/deactivate")
+    async def deactivate(fingerprint_id: str, body: RejectBody | None = None):
+        body = body or RejectBody()
+        try:
+            return await asyncio.to_thread(
+                writes_module.deactivate_rule, fingerprint_id,
+                actor=body.actor, reason=body.reason)
+        except writes.WriteError as exc:
+            raise _write_http_error(exc) from exc
+
+    @app.post("/api/rules/{rule_id}/reactivate")
+    async def reactivate(rule_id: int, body: RejectBody | None = None):
+        body = body or RejectBody()
+        try:
+            return await asyncio.to_thread(
+                writes_module.reactivate_rule, rule_id,
+                actor=body.actor, reason=body.reason)
+        except writes.WriteError as exc:
+            raise _write_http_error(exc) from exc
 
     return app
 

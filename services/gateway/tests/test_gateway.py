@@ -270,3 +270,441 @@ def test_r9_current_view_predicate_in_every_normalized_query(queries):
     for fn_name in ("fetch_stats", "fetch_events", "fetch_raw_trace", "poll_events"):
         src = inspect.getsource(getattr(queries, fn_name))
         assert "superseded_by_event_id IS NULL" in src, f"{fn_name} missing R9 predicate"
+
+
+# ================= M2 (Task 7): rules/samples/audit reads + write path =======
+# Everything below is ADDITIVE — the frozen M1 contract above is untouched.
+# Same monkeypatch pattern: new GETs return the queries-module fixtures
+# verbatim; POSTs forward to gateway.writes (asserted to run off the event
+# loop in a worker thread). The T9 fixes pin fetch_stats' truncation flag and
+# zero_fill_statuses' strictness through a fake _connect.
+
+RULE_ROW_KEYS = {
+    "id", "fingerprint_id", "version", "pattern", "mappings", "provenance", "confidence",
+    "status", "created_by", "created_at", "activated_at", "deactivated_at", "validation",
+}
+AUDIT_ROW_KEYS = {"id", "ts", "actor", "action", "entity", "detail"}
+
+
+def rule_row(**overrides) -> dict:
+    """One RuleRow as psycopg dict_row returns it (JSONB loaded, real datetimes)."""
+    row = {
+        "id": 7,
+        "fingerprint_id": "fp_ssh_denied",
+        "version": 3,
+        "pattern": r"^.*?DENIED\s+(?P<extension>.*)$",
+        "mappings": [{"source_field": "SRC", "ocsf_path": "src_endpoint.ip"}],
+        "provenance": "slm",
+        "confidence": 0.93,
+        "status": "active",
+        "created_by": "onboarding",
+        "created_at": datetime(2026, 9, 19, 9, 0, 0, tzinfo=UTC),
+        "activated_at": datetime(2026, 9, 19, 9, 5, 0, tzinfo=UTC),
+        "deactivated_at": None,
+        "validation": {"passed": True, "checks": {"caps_and_allowlist": True},
+                       "held_out_match_rate": 1.0, "notes": [], "previews": [],
+                       "prompt_count": 5, "held_out_count": 15},
+    }
+    row.update(overrides)
+    return row
+
+
+def audit_row(**overrides) -> dict:
+    row = {
+        "id": 41,
+        "ts": datetime(2026, 9, 19, 9, 5, 0, tzinfo=UTC),
+        "actor": "amy",
+        "action": "rule_approved",
+        "entity": "fp_ssh_denied",
+        "detail": {"rule_id": 7, "version": 3, "actor": "amy"},
+    }
+    row.update(overrides)
+    return row
+
+
+class _FakeRowsConn:
+    """Fake dict_row connection for the read helpers: records SQL, replays
+    scripted fetch results FIFO (consumed per fetchone / fetchall call)."""
+
+    def __init__(self, fetchone=(), fetchall=()):
+        self.sql = []
+        self.params = []
+        self._fetchone = [dict(r) for r in fetchone]
+        self._fetchall = [[dict(r) for r in batch] for batch in fetchall]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def cursor(self):
+        conn = self
+
+        class Cur:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql, params=None):
+                conn.sql.append(sql)
+                conn.params.append(params)
+
+            def fetchone(self):
+                return conn._fetchone.pop(0)
+
+            def fetchall(self):
+                return conn._fetchall.pop(0)
+
+        return Cur()
+
+
+def _raises(exc):
+    def _fn(*args, **kwargs):
+        raise exc
+
+    return _fn
+
+
+# ---------- GET /api/rules + GET /api/rules/{fp} ----------
+
+def test_rules_list_shape(client, queries, monkeypatch):
+    rows = [rule_row(), rule_row(id=8, version=4, status="pending_review",
+                                 activated_at=None)]
+    monkeypatch.setattr(queries, "fetch_rules", lambda status=None: rows)
+    r = client.get("/api/rules")
+    assert r.status_code == 200
+    assert r.json() == {"rules": [jsonable(row) for row in rows]}
+    assert set(r.json()["rules"][0]) == RULE_ROW_KEYS  # exact RuleRow keys
+
+
+def test_rules_status_filter_forwarded(client, queries, monkeypatch):
+    seen = {}
+
+    def fake(status=None):
+        seen["status"] = status
+        return []
+
+    monkeypatch.setattr(queries, "fetch_rules", fake)
+    assert client.get("/api/rules", params={"status": "pending_review"}).status_code == 200
+    assert seen["status"] == "pending_review"
+    assert client.get("/api/rules").status_code == 200  # no filter -> all statuses
+    assert seen["status"] is None
+
+
+def test_rule_history_shape(client, queries, monkeypatch):
+    body = {"rules": [rule_row(version=3), rule_row(version=2, status="superseded")],
+            "audit": [audit_row()]}
+    monkeypatch.setattr(queries, "fetch_rule_history", lambda fp: body)
+    r = client.get("/api/rules/fp_ssh_denied")
+    assert r.status_code == 200
+    assert r.json() == {
+        "rules": [jsonable(row) for row in body["rules"]],
+        "audit": [jsonable(row) for row in body["audit"]],
+    }
+
+
+# ---------- GET /api/onboarding/samples ----------
+
+def test_samples_status_single_fingerprint_form(client, queries, monkeypatch):
+    row = {"fingerprint_id": "fp_ssh_denied", "total": 20,
+           "by_role": {"prompt": 5, "held_out": 15, "unused": 0},
+           "latest_captured_at": datetime(2026, 9, 19, 10, 0, tzinfo=UTC)}
+    seen = {}
+
+    def fake(fingerprint=None):
+        seen["fingerprint"] = fingerprint
+        return [row]
+
+    monkeypatch.setattr(queries, "fetch_samples_status", fake)
+    r = client.get("/api/onboarding/samples", params={"fingerprint": "fp_ssh_denied"})
+    assert r.status_code == 200
+    assert r.json() == jsonable(row)  # fp given -> the single-fingerprint shape
+    assert seen["fingerprint"] == "fp_ssh_denied"
+
+
+def test_samples_status_all_fingerprints_form(client, queries, monkeypatch):
+    rows = [{"fingerprint_id": "fp_a", "total": 20,
+             "by_role": {"prompt": 5, "held_out": 15, "unused": 0},
+             "latest_captured_at": None}]
+    monkeypatch.setattr(queries, "fetch_samples_status", lambda fingerprint=None: rows)
+    r = client.get("/api/onboarding/samples")
+    assert r.status_code == 200
+    assert r.json() == {"samples": rows}  # omitted -> that shape per fingerprint
+
+
+# ---------- GET /api/audit ----------
+
+def test_audit_endpoint_forwards_filters(client, queries, monkeypatch):
+    rows = [audit_row()]
+    seen = {}
+
+    def fake(fingerprint=None, limit=50):
+        seen.update(fingerprint=fingerprint, limit=limit)
+        return rows
+
+    monkeypatch.setattr(queries, "fetch_audit", fake)
+    r = client.get("/api/audit", params={"fingerprint": "fp_ssh_denied", "limit": 10})
+    assert r.status_code == 200
+    assert r.json() == {"audit": [jsonable(row) for row in rows]}
+    assert set(r.json()["audit"][0]) == AUDIT_ROW_KEYS
+    assert seen == {"fingerprint": "fp_ssh_denied", "limit": 10}
+
+
+def test_audit_limit_bounds_rejected(client):
+    assert client.get("/api/audit", params={"limit": 501}).status_code == 422
+    assert client.get("/api/audit", params={"limit": 0}).status_code == 422
+
+
+# ---------- read helpers over a fake conn (real SQL pinned) ----------
+
+def test_fetch_rules_filters_status_and_orders(queries, monkeypatch):
+    conn = _FakeRowsConn(fetchall=[[rule_row()]])
+    monkeypatch.setattr(queries, "_connect", lambda: conn)
+    assert queries.fetch_rules("pending_review") == [rule_row()]
+    assert "WHERE (%s::text IS NULL OR status = %s)" in conn.sql[0]
+    assert "ORDER BY fingerprint_id, version DESC" in conn.sql[0]
+    assert conn.params[0] == ("pending_review", "pending_review")
+
+
+def test_fetch_rule_history_returns_rules_and_scoped_audit(queries, monkeypatch):
+    conn = _FakeRowsConn(fetchall=[
+        [rule_row(version=3), rule_row(version=2, status="superseded")],
+        [audit_row()],
+    ])
+    monkeypatch.setattr(queries, "_connect", lambda: conn)
+    body = queries.fetch_rule_history("fp_ssh_denied")
+    assert body["rules"][0]["version"] == 3  # versions newest-first
+    assert body["audit"] == [audit_row()]
+    assert "ORDER BY version DESC" in conn.sql[0]
+    assert "FROM audit_log" in conn.sql[1] and "ORDER BY id DESC LIMIT 200" in conn.sql[1]
+    assert conn.params[1] == ("fp_ssh_denied",)
+
+
+def test_fetch_samples_status_groups_by_fingerprint_and_role(queries, monkeypatch):
+    latest = datetime(2026, 9, 19, 10, 0, tzinfo=UTC)
+    conn = _FakeRowsConn(fetchall=[[
+        {"fingerprint_id": "fp_a", "total": 20, "prompt": 5, "held_out": 15,
+         "unused": 0, "latest_captured_at": latest},
+    ]])
+    monkeypatch.setattr(queries, "_connect", lambda: conn)
+    assert queries.fetch_samples_status() == [{
+        "fingerprint_id": "fp_a", "total": 20,
+        "by_role": {"prompt": 5, "held_out": 15, "unused": 0},
+        "latest_captured_at": latest,
+    }]
+    assert "GROUP BY fingerprint_id" in conn.sql[0]
+    assert conn.params[0] == (None, None)
+
+
+def test_fetch_samples_status_zero_fills_unknown_fingerprint(queries, monkeypatch):
+    conn = _FakeRowsConn(fetchall=[[]])
+    monkeypatch.setattr(queries, "_connect", lambda: conn)
+    assert queries.fetch_samples_status("fp_none") == [{
+        "fingerprint_id": "fp_none", "total": 0,
+        "by_role": {"prompt": 0, "held_out": 0, "unused": 0},
+        "latest_captured_at": None,
+    }]
+    assert conn.params[0] == ("fp_none", "fp_none")
+
+
+def test_fetch_audit_scopes_entity_and_clamps_limit(queries, monkeypatch):
+    conn = _FakeRowsConn(fetchall=[[audit_row()]])
+    monkeypatch.setattr(queries, "_connect", lambda: conn)
+    assert queries.fetch_audit(fingerprint="fp_ssh_denied", limit=10**9) == [audit_row()]
+    assert "FROM audit_log" in conn.sql[0] and "ORDER BY id DESC LIMIT %s" in conn.sql[0]
+    assert conn.params[0] == ("fp_ssh_denied", "fp_ssh_denied", 500)
+
+
+# ---------- T9 fixes ----------
+
+def test_fetch_stats_flags_by_fingerprint_truncation_at_cap(queries, monkeypatch):
+    conn = _FakeRowsConn(
+        fetchone=[{"n": 1}, {"n": 0}],
+        fetchall=[[], [{"fingerprint_id": f"fp_{i}", "total": 1, "parsed": 1}
+                       for i in range(queries.MAX_LIMIT)]],
+    )
+    monkeypatch.setattr(queries, "_connect", lambda: conn)
+    out = queries.fetch_stats()
+    assert out["by_fingerprint_truncated"] is True  # LIMIT cap hit -> say so
+
+
+def test_fetch_stats_omits_truncation_key_below_cap(queries, monkeypatch):
+    conn = _FakeRowsConn(
+        fetchone=[{"n": 1}, {"n": 0}],
+        fetchall=[[], [{"fingerprint_id": f"fp_{i}", "total": 1, "parsed": 1}
+                       for i in range(queries.MAX_LIMIT - 1)]],
+    )
+    monkeypatch.setattr(queries, "_connect", lambda: conn)
+    assert "by_fingerprint_truncated" not in queries.fetch_stats()  # additive only
+
+
+def test_zero_fill_statuses_rejects_unknown_status_key(queries):
+    with pytest.raises(ValueError):
+        queries.zero_fill_statuses([{"status": "weird", "n": 1}])
+    # the known four still zero-fill
+    assert queries.zero_fill_statuses([{"status": "parsed", "n": 2}])["parsed"] == 2
+
+
+# ---------- POST write endpoints (forward to gateway.writes) ----------
+
+def test_approve_endpoint_forwards_and_runs_in_worker_thread(client, monkeypatch):
+    import threading
+
+    from gateway import writes
+
+    seen = {}
+
+    def fake(fp, cid, **kwargs):
+        seen["fp"], seen["cid"], seen["kwargs"] = fp, cid, kwargs
+        seen["main_thread"] = threading.current_thread() is threading.main_thread()
+        return {"rule_id": 9, "version": 3, "status": "active"}
+
+    monkeypatch.setattr(writes, "approve_candidate", fake)
+    r = client.post("/api/rules/fp_ssh_denied/candidates/9/approve",
+                    json={"actor": "amy", "reason": "checked held-out"})
+    assert r.status_code == 200
+    assert r.json() == {"rule_id": 9, "version": 3, "status": "active"}
+    assert (seen["fp"], seen["cid"]) == ("fp_ssh_denied", 9)
+    assert seen["kwargs"]["actor"] == "amy"
+    assert seen["kwargs"]["reason"] == "checked held-out"
+    assert seen["main_thread"] is False  # asyncio.to_thread, not the event loop
+
+
+def test_approve_edited_mappings_forwarded_as_dicts(client, monkeypatch):
+    from gateway import writes
+
+    seen = {}
+
+    def fake(fp, cid, **kwargs):
+        seen.update(kwargs)
+        return {"rule_id": 10, "version": 4, "status": "active"}
+
+    monkeypatch.setattr(writes, "approve_candidate", fake)
+    r = client.post("/api/rules/fp/candidates/9/approve", json={
+        "actor": "amy",
+        "edited_mappings": [{"source_field": "SRC", "ocsf_path": "src_endpoint.ip"}],
+    })
+    assert r.status_code == 200
+    assert seen["edited_mappings"] == [{"source_field": "SRC",
+                                        "ocsf_path": "src_endpoint.ip"}]
+    assert seen["override"] is None
+
+
+def test_approve_error_mapping_404_and_409(client, monkeypatch):
+    from gateway import writes
+
+    monkeypatch.setattr(writes, "approve_candidate", _raises(writes.NotFoundError("gone")))
+    assert client.post("/api/rules/fp/candidates/9/approve", json={}).status_code == 404
+
+    monkeypatch.setattr(writes, "approve_candidate",
+                        _raises(writes.ConflictError("not pending")))
+    assert client.post("/api/rules/fp/candidates/9/approve", json={}).status_code == 409
+
+
+def _gate_failure_report():
+    from ulpf_core.validation import CandidateReport
+
+    return CandidateReport(
+        passed=False,
+        checks={"caps_and_allowlist": False, "samples_parse": False,
+                "held_out_match_all": False, "ip_fields_valid": True,
+                "port_fields_valid": True, "no_orphan_mappings": True,
+                "adversarial_probe": True, "no_hardcoded_literals": True},
+        held_out_match_rate=0.0,
+        notes=["compile error: boom"],
+    )
+
+
+def test_manual_422_carries_gate_checks_and_notes(client, monkeypatch):
+    from gateway import writes
+
+    report = _gate_failure_report()
+    monkeypatch.setattr(writes, "create_manual_candidate",
+                        _raises(writes.ValidationError(report)))
+    r = client.post("/api/rules/manual", json={
+        "fingerprint_id": "fp_a", "pattern": "^(", "mappings": [], "actor": "amy"})
+    assert r.status_code == 422
+    # FastAPI HTTPException detail: the gate's checks/notes, faithful for the UI
+    assert r.json()["detail"]["checks"] == report.checks
+    assert r.json()["detail"]["notes"] == report.notes
+
+
+def test_approve_revalidation_failure_maps_to_422(client, monkeypatch):
+    from gateway import writes
+
+    report = _gate_failure_report()
+    monkeypatch.setattr(writes, "approve_candidate", _raises(writes.ValidationError(report)))
+    r = client.post("/api/rules/fp/candidates/9/approve", json={
+        "edited_mappings": [{"source_field": "SRC", "ocsf_path": "bogus.path"}]})
+    assert r.status_code == 422
+    assert r.json()["detail"]["notes"] == report.notes
+
+
+def test_manual_endpoint_201_and_forwards(client, monkeypatch):
+    from gateway import writes
+
+    seen = {}
+
+    def fake(fp, pattern, mappings, **kwargs):
+        seen.update(fp=fp, pattern=pattern, mappings=mappings, **kwargs)
+        return {"rule_id": 12, "version": 1, "status": "pending_review"}
+
+    monkeypatch.setattr(writes, "create_manual_candidate", fake)
+    r = client.post("/api/rules/manual", json={
+        "fingerprint_id": "fp_new", "pattern": "^.*?(?P<extension>.*)$",
+        "mappings": [{"source_field": "msg", "ocsf_path": "message"}],
+        "actor": "amy", "confidence": 0.5})
+    assert r.status_code == 201
+    assert r.json() == {"rule_id": 12, "version": 1, "status": "pending_review"}
+    assert seen["fp"] == "fp_new"
+    assert seen["mappings"] == [{"source_field": "msg", "ocsf_path": "message"}]
+    assert seen["actor"] == "amy" and seen["confidence"] == 0.5
+
+
+def test_reject_endpoint_forwards(client, monkeypatch):
+    from gateway import writes
+
+    seen = {}
+
+    def fake(fp, cid, **kwargs):
+        seen.update(fp=fp, cid=cid, **kwargs)
+        return {"status": "rejected"}
+
+    monkeypatch.setattr(writes, "reject_candidate", fake)
+    r = client.post("/api/rules/fp/candidates/9/reject",
+                    json={"actor": "amy", "reason": "bad"})
+    assert r.status_code == 200
+    assert r.json() == {"status": "rejected"}
+    assert (seen["fp"], seen["cid"]) == ("fp", 9)
+    assert seen["actor"] == "amy" and seen["reason"] == "bad"
+
+
+def test_deactivate_and_reactivate_endpoints_forward(client, monkeypatch):
+    from gateway import writes
+
+    seen = {}
+
+    def fake_deactivate(fp, **kwargs):
+        seen["deactivate"] = (fp, kwargs)
+        return {"rule_id": 5, "version": 2, "status": "deactivated"}
+
+    def fake_reactivate(rule_id, **kwargs):
+        seen["reactivate"] = (rule_id, kwargs)
+        return {"rule_id": 5, "version": 2, "status": "active"}
+
+    monkeypatch.setattr(writes, "deactivate_rule", fake_deactivate)
+    monkeypatch.setattr(writes, "reactivate_rule", fake_reactivate)
+
+    r = client.post("/api/rules/fp_ssh_denied/deactivate", json={"actor": "amy"})
+    assert r.status_code == 200
+    assert r.json() == {"rule_id": 5, "version": 2, "status": "deactivated"}
+    assert seen["deactivate"] == ("fp_ssh_denied", {"actor": "amy", "reason": None})
+
+    r = client.post("/api/rules/5/reactivate")  # empty body allowed
+    assert r.status_code == 200
+    assert r.json() == {"rule_id": 5, "version": 2, "status": "active"}
+    assert seen["reactivate"][0] == 5
+    assert seen["reactivate"][1]["actor"] == "anonymous"  # default actor
