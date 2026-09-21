@@ -22,6 +22,10 @@ if TYPE_CHECKING:
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 500
 SNAPSHOT_LIMIT = 100  # SSE initial snapshot: latest N rows, emitted oldest-first
+# Export rows are bulk (SIEM/data-lake integration), so the export endpoints
+# get their OWN cap — 100x MAX_LIMIT — kept separate so the interactive LIMIT
+# clamp can never silently widen (and vice versa).
+EXPORT_MAX = 50_000
 
 _STATUS_KEYS = ("parsed", "unparsed", "parse_error", "quarantined")
 
@@ -304,3 +308,40 @@ def fetch_drift_alerts(limit=DEFAULT_LIMIT) -> list[dict]:
         )
         audits = [dict(row, kind="audit") for row in cur.fetchall()]
     return sorted(windows + audits, key=_alert_recency, reverse=True)[:limit]
+
+
+# --- M3 exports (Task 8; spec §11 / PS g+h — SIEM/data-lake integration) --------
+
+def clamp_export_limit(limit: int) -> int:
+    """Export LIMIT clamp: 1..EXPORT_MAX regardless of caller input. The export
+    endpoints take an UNBOUNDED limit param (no FastAPI le= — a bulk export
+    must not 422) and clamp here, in the query: one enforcement point, pinned
+    by the fake-conn tests."""
+    return max(1, min(int(limit), EXPORT_MAX))
+
+
+def fetch_export_rows(fingerprint=None, status=None, limit=EXPORT_MAX):
+    """Export fetch shared by GET /api/export/{ocsf,parquet}: current view
+    (R9 predicate), EventRow columns + ocsf, newest first, clamp-capped at
+    EXPORT_MAX.
+
+    PARSED-ONLY by design: the exports carry OCSF documents, and only parsed
+    rows have one. The `status = 'parsed'` literal is module-controlled
+    vocabulary (never request input), so it stays a literal like the
+    drift-severity lists; the status param narrows WITHIN parsed — it arrives
+    parameterized and INTERSECTS, so status=unparsed/parse_error/quarantined
+    selects nothing (non-parsed rows are skipped here, in SQL — the JSONL
+    stream never carries a "null" line) rather than erroring."""
+    limit = clamp_export_limit(limit)
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT event_id, raw_id, fingerprint_id, rule_version, status, parsed_at, ocsf "
+            "FROM normalized_events "
+            "WHERE superseded_by_event_id IS NULL "
+            "AND status = 'parsed' "
+            "AND (%s::text IS NULL OR status = %s) "
+            "AND (%s::text IS NULL OR fingerprint_id = %s) "
+            "ORDER BY parsed_at DESC LIMIT %s",
+            (status, status, fingerprint, fingerprint, limit),
+        )
+        return cur.fetchall()

@@ -263,11 +263,13 @@ def test_clamp_limit(queries):
 def test_r9_current_view_predicate_in_every_normalized_query(queries):
     # Controller R9: EVERY query over normalized_events carries
     # `superseded_by_event_id IS NULL` — fetch_stats (3 normalized queries),
-    # fetch_events, fetch_raw_trace (join), poll_events. fetch_chain_heads is
-    # deliberately absent (raw_batches has no supersede column).
+    # fetch_events, fetch_raw_trace (join), poll_events, fetch_export_rows
+    # (M3 export fetch). fetch_chain_heads is deliberately absent
+    # (raw_batches has no supersede column).
     import inspect
 
-    for fn_name in ("fetch_stats", "fetch_events", "fetch_raw_trace", "poll_events"):
+    for fn_name in ("fetch_stats", "fetch_events", "fetch_raw_trace", "poll_events",
+                    "fetch_export_rows"):
         src = inspect.getsource(getattr(queries, fn_name))
         assert "superseded_by_event_id IS NULL" in src, f"{fn_name} missing R9 predicate"
 
@@ -885,3 +887,207 @@ def test_unquarantine_error_mapping_404_and_409(client, monkeypatch):
                         _raises(writes.ConflictError("not quarantined")))
     assert client.post("/api/rules/fp_a/unquarantine",
                        json={"field": "x"}).status_code == 409
+
+
+# ============== M3 (Task 8): export endpoints (OCSF JSONL + Parquet) ===========
+# Both exports share fetch_export_rows (parsed-only current view, newest
+# first, EXPORT_MAX-capped). Route tests monkeypatch the fetch and pin the
+# wire bytes; fake-conn tests pin the real SQL — the parsed-only literal, the
+# intersecting status filter, the R9 predicate, and the cap clamp (the ONE
+# enforcement point). The Parquet tests round-trip the ACTUAL response bytes
+# through pq.read_table — the same path a data lake takes.
+
+PARQUET_COLUMNS = ["event_id", "raw_id", "fingerprint_id",
+                   "rule_version", "status", "parsed_at", "ocsf"]
+
+
+def ocsf_doc(**overrides) -> dict:
+    """One realistic parsed-row OCSF document (class_uid 4001 = File Activity,
+    nested attributes exactly as the JSONB column loads them)."""
+    doc = {"class_uid": 4001, "activity_name": "Open",
+           "severity_id": 99, "src_endpoint": {"ip": "10.1.2.3", "port": 51000}}
+    doc.update(overrides)
+    return doc
+
+
+def _read_parquet(content):
+    import io
+
+    import pyarrow.parquet as pq
+
+    return pq.read_table(io.BytesIO(content))
+
+
+# ---------- GET /api/export/ocsf (JSONL) ----------
+
+def test_export_ocsf_one_ocsf_doc_per_line(client, queries, monkeypatch):
+    rows = [event_row(ocsf=ocsf_doc(activity_name="Open"),
+                      event_id=uuid.UUID("11111111-1111-1111-1111-111111111111")),
+            event_row(ocsf=ocsf_doc(activity_name="Close",
+                                    dst_endpoint={"ip": "192.0.2.9"}))]
+    monkeypatch.setattr(queries, "fetch_export_rows", lambda *a, **k: rows)
+    r = client.get("/api/export/ocsf")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/x-ndjson")
+    lines = r.content.decode("utf-8").splitlines()
+    assert len(lines) == 2  # one line per row: the OCSF doc alone, not EventRow
+    docs = [json.loads(line) for line in lines]
+    assert all(doc["class_uid"] == 4001 for doc in docs)
+    assert docs == [rows[0]["ocsf"], rows[1]["ocsf"]]  # faithful, unkeyed
+    assert r.content.decode("utf-8").endswith("\n")  # NDJSON trailing newline
+
+
+def test_export_ocsf_newest_first(client, queries, monkeypatch):
+    # fetch_export_rows orders newest first (pinned in the SQL below); the
+    # stream must emit that order unchanged — line 0 is the newest row's doc.
+    newest = event_row(parsed_at=datetime(2026, 9, 21, 12, 0, tzinfo=UTC),
+                       ocsf=ocsf_doc(time=2))
+    oldest = event_row(parsed_at=datetime(2026, 9, 21, 11, 0, tzinfo=UTC),
+                       ocsf=ocsf_doc(time=1))
+    monkeypatch.setattr(queries, "fetch_export_rows", lambda *a, **k: [newest, oldest])
+    r = client.get("/api/export/ocsf")
+    docs = [json.loads(line) for line in r.content.decode("utf-8").splitlines()]
+    assert [doc["time"] for doc in docs] == [2, 1]
+
+
+def test_export_ocsf_forwards_filters_runs_off_loop_and_defaults(
+        client, queries, monkeypatch):
+    import threading
+
+    seen = {}
+
+    def fake(fingerprint=None, status=None, limit=None):
+        seen.update(fingerprint=fingerprint, status=status, limit=limit)
+        seen["main_thread"] = threading.current_thread() is threading.main_thread()
+        return []
+
+    monkeypatch.setattr(queries, "fetch_export_rows", fake)
+    assert client.get("/api/export/ocsf").status_code == 200
+    # defaults: no fingerprint/status filters, bulk default limit = EXPORT_MAX
+    assert (seen["fingerprint"], seen["status"]) == (None, None)
+    assert seen["limit"] == queries.EXPORT_MAX
+    assert seen["main_thread"] is False  # fetch + line assembly in a worker thread
+
+    assert client.get("/api/export/ocsf", params={
+        "fingerprint": "fp_ssh_denied", "status": "parsed", "limit": 100,
+    }).status_code == 200
+    assert seen["fingerprint"] == "fp_ssh_denied" and seen["status"] == "parsed"
+    assert seen["limit"] == 100
+
+
+def test_export_ocsf_nonparsed_status_is_skipped_not_nulled(client, queries, monkeypatch):
+    # The status filter narrows WITHIN parsed: status=unparsed matches nothing
+    # (non-parsed rows have no OCSF document), so the export is a 200 with an
+    # EMPTY stream — never a "null" line. What the SQL selects is pinned in
+    # test_fetch_export_rows_sql below; here the route contract: 200, empty.
+    seen = {}
+
+    def fake(fingerprint=None, status=None, limit=None):
+        seen["status"] = status
+        return []  # what the parsed-only SQL selects for status=unparsed
+
+    monkeypatch.setattr(queries, "fetch_export_rows", fake)
+    r = client.get("/api/export/ocsf", params={"status": "unparsed"})
+    assert r.status_code == 200
+    assert r.content == b""
+    assert seen["status"] == "unparsed"  # forwarded, applied inside the fetch
+
+
+def test_export_ocsf_huge_limit_is_clamped_not_rejected(client, queries, monkeypatch):
+    # Bulk exports must not 422: no le= on the param; EXPORT_MAX is enforced
+    # inside fetch_export_rows (pinned below via the fake conn).
+    monkeypatch.setattr(queries, "fetch_export_rows", lambda *a, **k: [])
+    assert client.get("/api/export/ocsf", params={"limit": 10**12}).status_code == 200
+
+
+# ---------- GET /api/export/parquet ----------
+
+def test_export_parquet_round_trips_rows(client, queries, monkeypatch):
+    import pyarrow as pa
+
+    rows = [event_row(ocsf=ocsf_doc()), event_row(ocsf=ocsf_doc(severity_id=1),
+                                                  rule_version=4)]
+    monkeypatch.setattr(queries, "fetch_export_rows", lambda *a, **k: rows)
+    r = client.get("/api/export/parquet")
+    assert r.status_code == 200
+    table = _read_parquet(r.content)  # the data-lake path: bytes -> table
+    assert table.num_rows == 2
+    assert table.column_names == PARQUET_COLUMNS  # EventRow order, flat schema
+    assert table.schema.field("rule_version").type == pa.int32()
+    # wire serialization applied BEFORE the table (UUID -> str, datetime ->
+    # ISO-8601): byte-identical to what the JSONL endpoint's _json_default puts out
+    assert table.column("event_id").to_pylist() == [str(row["event_id"]) for row in rows]
+    assert table.column("raw_id").to_pylist() == [str(row["raw_id"]) for row in rows]
+    assert table.column("parsed_at").to_pylist() == ["2026-09-19T12:00:00+00:00"] * 2
+    assert table.column("rule_version").to_pylist() == [3, 4]
+    # ocsf column = one JSON string per row; parsing it back yields the doc
+    ocsf_strings = table.column("ocsf").to_pylist()
+    assert ocsf_strings == [json.dumps(row["ocsf"]) for row in rows]
+    assert [json.loads(s) for s in ocsf_strings] == [row["ocsf"] for row in rows]
+
+
+def test_export_parquet_headers_and_empty_valid_file(client, queries, monkeypatch):
+    monkeypatch.setattr(queries, "fetch_export_rows", lambda *a, **k: [])
+    r = client.get("/api/export/parquet")
+    assert r.status_code == 200  # 200 always: empty export = empty file, not error
+    assert r.headers["content-type"].startswith("application/octet-stream")
+    assert r.headers["content-disposition"] == \
+        'attachment; filename="ulpf-events.parquet"'
+    table = _read_parquet(r.content)
+    assert table.num_rows == 0
+    assert table.column_names == PARQUET_COLUMNS  # schema present and stable
+
+
+def test_export_parquet_forwards_fingerprint_parsed_default_and_cap(
+        client, queries, monkeypatch):
+    seen = {}
+
+    def fake(fingerprint=None, status=None, limit=None):
+        seen.update(fingerprint=fingerprint, status=status, limit=limit)
+        return []
+
+    monkeypatch.setattr(queries, "fetch_export_rows", fake)
+    assert client.get("/api/export/parquet").status_code == 200
+    assert seen == {"fingerprint": None, "status": None, "limit": queries.EXPORT_MAX}
+
+    assert client.get("/api/export/parquet", params={
+        "fingerprint": "fp_x", "limit": 7}).status_code == 200
+    # frozen signature has NO status param — the fetch's parsed-only default rides
+    assert seen == {"fingerprint": "fp_x", "status": None, "limit": 7}
+
+    # cap enforced as a clamp, never a 422 (same shared fetch as JSONL)
+    assert client.get("/api/export/parquet", params={"limit": 10**12}).status_code == 200
+
+
+# ---------- export fetch over a fake conn (real SQL + cap pinned) ----------
+
+def test_fetch_export_rows_sql_pins_parsed_only_filters_order_and_cap(
+        queries, monkeypatch):
+    row = event_row()
+    conn = _FakeRowsConn(fetchall=[[row]])
+    monkeypatch.setattr(queries, "_connect", lambda: conn)
+    out = queries.fetch_export_rows(fingerprint="fp_a", status=None, limit=10**9)
+    assert out == [row]
+    sql = conn.sql[0]
+    assert "superseded_by_event_id IS NULL" in sql  # R9 current view
+    assert "AND status = 'parsed'" in sql  # parsed-only literal (module vocabulary)
+    assert "AND (%s::text IS NULL OR status = %s)" in sql  # narrows WITHIN parsed
+    assert "AND (%s::text IS NULL OR fingerprint_id = %s)" in sql
+    assert "ORDER BY parsed_at DESC LIMIT %s" in sql  # newest first
+    # nonsense limit clamped to EXPORT_MAX; None statuses forwarded as-is
+    assert conn.params[0] == (None, None, "fp_a", "fp_a", queries.EXPORT_MAX)
+
+    # the status param intersects: forwarded parameterized, never interpolated
+    conn2 = _FakeRowsConn(fetchall=[[row]])
+    monkeypatch.setattr(queries, "_connect", lambda: conn2)
+    queries.fetch_export_rows(status="unparsed")
+    assert conn2.params[0][:2] == ("unparsed", "unparsed")
+
+
+def test_clamp_export_limit(queries):
+    assert queries.EXPORT_MAX == 50_000  # separate from MAX_LIMIT (500)
+    assert queries.clamp_export_limit(123) == 123
+    assert queries.clamp_export_limit(50_000) == 50_000
+    assert queries.clamp_export_limit(10**12) == queries.EXPORT_MAX
+    assert queries.clamp_export_limit(0) == 1
+    assert queries.clamp_export_limit(-5) == 1

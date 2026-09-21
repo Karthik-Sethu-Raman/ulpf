@@ -1,4 +1,8 @@
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 psycopg[binary]==3.2.1
+# Controller P-6: 18.1.0, NOT 17.0.0 — 17.0.0 has no cp313 wheel and the
+# py3.13 host must run the same version as CI (py3.12) and the image; 18.1.0
+# ships both cp312 and cp313 wheels.
+pyarrow==18.1.0
 httpx  # tests (FastAPI TestClient), dev
