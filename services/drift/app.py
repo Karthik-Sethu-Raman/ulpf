@@ -1,30 +1,54 @@
 # services/drift/app.py — the drift service entrypoint: ONE convergent loop
 # (cold path, Postgres only — no Kafka).
 #
-# Per poll: load active rules, then for each rule one stateless scan —
-# fetch_current_view (the DB current view) -> compute_windows (pure, data-only
-# horizon) -> window_rows (tier-1) -> insert_windows (idempotent by the
-# deterministic window key). Fail-closed posture: drift NEVER blocks anything
-# else — every exception is logged with traceback and the loop continues; a
-# failed scan is simply retried on the next poll. Tier-2 evaluation, baselines
-# and enforcement join this loop in Task 5.
+# Per poll: load active rules, then for each rule one stateless scan, in the
+# frozen order — fetch_current_view (the DB current view) -> compute_windows
+# (pure, data-only horizon) -> evaluate_window (tier-1 always; tier-2 only
+# against an existing baseline profile) -> record_windows (idempotent by the
+# deterministic window key) -> FIRST baseline insert when the Nth baseline
+# window just closed -> enforce_findings worst-first. Ruling: on the
+# establishing scan itself the baseline profile does not exist yet at
+# evaluation time, so that scan is tier-1-only by construction — the windows
+# BEYOND the Nth on that same scan keep their first-recorded tier-1 severity
+# (ON CONFLICT DO NOTHING), but the next scan re-evaluates the whole current
+# view WITH the profile and enforcement converges. Fail-closed posture: drift
+# NEVER blocks anything else — every exception is logged with traceback and
+# the loop continues; a failed scan is simply retried on the next poll.
 import logging
 import threading
 
 from drift.config import Config
-from drift.detect import window_rows
+from drift.detect import Finding, aggregate_baseline, evaluate_window
+from drift.enforce import enforce_findings, record_windows
 from drift.store import (
     ActiveDriftRule,
     baseline_for,
     connect_db,
     fetch_current_view,
+    fetch_window_history,
     first_window_unmapped,
-    insert_windows,
+    insert_baseline,
     load_active_rules,
 )
 from drift.windows import compute_windows
 
 log = logging.getLogger("drift.app")
+
+
+def establish_baseline(conn, cfg: Config, rule: ActiveDriftRule) -> bool:
+    """The FIRST baseline insert, once due (R-M3-7): after this scan's windows
+    are recorded, aggregate the version's first cfg.baseline_windows closed
+    windows and INSERT the profiles once. Returns False while fewer than N
+    windows exist; insert_baseline's existence guard + ON CONFLICT make later
+    scans no-ops (the 11th scan never re-inserts), and a version bump re-arms
+    naturally — the new (fingerprint, version) has no profile, so tier-1-only
+    baseline windows accumulate again."""
+    history = fetch_window_history(conn, rule.fingerprint_id, rule.version)
+    profiles = aggregate_baseline(history, baseline_windows=cfg.baseline_windows)
+    if profiles is None:
+        return False
+    return insert_baseline(conn, rule.fingerprint_id, rule.version,
+                           profiles, cfg.baseline_windows)
 
 
 def scan_rule(cfg: Config, rule: ActiveDriftRule) -> int:
@@ -45,7 +69,15 @@ def scan_rule(cfg: Config, rule: ActiveDriftRule) -> int:
         )
         if not windows:
             return 0
-        insert_windows(conn, window_rows(rule, windows))
+        findings: list[Finding] = []
+        for win in windows:
+            window_findings = evaluate_window(
+                win, baseline, rule_quarantined=rule.quarantined_fields)
+            record_windows(conn, rule, window_findings, win)
+            findings.extend(window_findings)
+        if baseline is None:
+            establish_baseline(conn, cfg, rule)
+        enforce_findings(conn, rule, findings)
     log.info("scanned %s v%d: %d closed window(s) over %d current-view row(s)",
              rule.fingerprint_id, rule.version, len(windows), len(rows))
     return len(windows)

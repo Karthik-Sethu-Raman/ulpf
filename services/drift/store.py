@@ -124,6 +124,24 @@ def baseline_for(conn: psycopg.Connection, fingerprint_id: str,
     return {field: profile for field, profile in rows} or None
 
 
+def fetch_window_history(conn: psycopg.Connection, fingerprint_id: str,
+                         version: int) -> list[tuple]:
+    """(window_start, field, events_count, null_rate, match_rate, shape_dist)
+    rows of the version's drift_windows, oldest window first, field-sorted
+    within a window — the ordered input detect.aggregate_baseline slices the
+    FIRST N closed windows from (the whole history is read: it is bounded by
+    raw retention, and the scan is a cold path)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT window_start, field, events_count, null_rate, match_rate, "
+            "shape_dist FROM drift_windows "
+            "WHERE fingerprint_id = %s AND rule_version = %s "
+            "ORDER BY window_start, field",
+            (fingerprint_id, version),
+        )
+        return cur.fetchall()
+
+
 def first_window_unmapped(conn: psycopg.Connection, fingerprint_id: str,
                           version: int) -> set[str]:
     """Unmapped keys of the baseline's FIRST window — the key set new unmapped

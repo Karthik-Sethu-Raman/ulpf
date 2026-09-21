@@ -11,6 +11,7 @@ from drift.store import (
     ActiveDriftRule,
     baseline_for,
     fetch_current_view,
+    fetch_window_history,
     first_window_unmapped,
     insert_baseline,
     insert_windows,
@@ -179,6 +180,22 @@ def test_baseline_for_maps_fields_to_profiles():
     conn = FakeConn(fetchall_results=[profiles])
     assert baseline_for(conn, "fp_a", 2) == {
         "src_endpoint.ip": {"null_rate": 0.1}, "__rule__": {"match_rate": 1.0}}
+
+
+# --- fetch_window_history: the baseline aggregation input (Task 5) ---------------
+
+
+def test_fetch_window_history_reads_version_rows_oldest_first():
+    rows = [("w0", "src_endpoint.ip", 10, 0.1, None, {"ipv4": 10})]
+    conn = FakeConn(fetchall_results=[rows])
+    assert fetch_window_history(conn, "fp_a", 2) == rows
+
+    sql = next(s for s in conn.sql if isinstance(s, str))
+    assert sql == ("SELECT window_start, field, events_count, null_rate, match_rate, "
+                   "shape_dist FROM drift_windows "
+                   "WHERE fingerprint_id = %s AND rule_version = %s "
+                   "ORDER BY window_start, field")
+    assert conn.params[conn.sql.index(sql)] == ("fp_a", 2)
 
 
 # --- first_window_unmapped: the baseline's first-window key set ------------------
