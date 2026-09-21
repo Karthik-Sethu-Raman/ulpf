@@ -48,3 +48,7 @@ references/
 node_modules/
 web/dist/
 .pytest_cache/
+
+# M3 pre-work: submission artifacts + demo residue (rooted)
+/brag-output/
+/testdata/
