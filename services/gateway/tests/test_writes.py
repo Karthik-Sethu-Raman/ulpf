@@ -502,3 +502,64 @@ def test_reactivate_rowcount_zero_conflicts_without_audit():
         writes.reactivate_rule(5, conn=conn)
     assert not _audit_rows(conn)
     assert "TXN-ROLLBACK" in conn.sql
+
+
+# --- un-quarantine (M3 Task 7: human override of drift's field quarantine) -----
+
+
+def test_unquarantine_removes_field_audits_inside_txn_and_returns_post_state():
+    conn = FakeConn(fetchone=[
+        {"id": 5},  # existence: the fingerprint has rule rows
+        {"quarantined_fields": [], "id": 5, "version": 2},  # RETURNING post-state
+    ])
+    result = writes.unquarantine_field("fp_a", "src_endpoint.ip", actor="amy",
+                                       reason="false positive", conn=conn)
+
+    assert result == {"fingerprint_id": "fp_a", "field": "src_endpoint.ip",
+                      "quarantined_fields": []}
+    assert conn.txns_opened == 1  # single transaction
+    assert conn.sql[0] == "TXN-START" and conn.sql[-1] == "TXN-COMMIT"
+
+    # Existence pre-check: any rule row proves the fingerprint known (status
+    # deliberately unfiltered — inactive is a 409, not a 404).
+    assert "SELECT id FROM rules WHERE fingerprint_id = %s LIMIT 1" in conn.sql[1]
+    assert conn.params[1] == ("fp_a",)
+
+    updates = _statements(conn, "UPDATE rules")
+    assert len(updates) == 1
+    assert "quarantined_fields = array_remove(quarantined_fields, %s)" in updates[0][0]
+    assert "WHERE fingerprint_id = %s AND status = 'active'" in updates[0][0]
+    assert "(%s = ANY(quarantined_fields))" in updates[0][0]  # TOCTOU predicate
+    assert updates[0][1] == ("src_endpoint.ip", "fp_a", "src_endpoint.ip")
+
+    audits = _audit_rows(conn)
+    assert len(audits) == 1
+    (actor, action, entity, _), detail = audits[0]
+    assert (actor, action, entity) == ("amy", "field_unquarantined", "fp_a")
+    assert detail == {"field": "src_endpoint.ip", "rule_id": 5, "version": 2,
+                      "reason": "false positive"}
+    # audit paired INSIDE the mutation's transaction bracket
+    start, end = conn.sql.index("TXN-START"), conn.sql.index("TXN-COMMIT")
+    audit_idx = next(i for i, sql in enumerate(conn.sql)
+                     if isinstance(sql, str) and sql.startswith("INSERT INTO audit_log"))
+    assert start < audit_idx < end
+
+
+def test_unquarantine_unknown_fingerprint_not_found():
+    conn = FakeConn(fetchone=[None])
+    with pytest.raises(writes.NotFoundError):
+        writes.unquarantine_field("fp_none", "src_endpoint.ip", conn=conn)
+    assert not _statements(conn, "UPDATE rules")
+    assert not _audit_rows(conn)
+
+
+def test_unquarantine_field_not_quarantined_or_inactive_conflicts():
+    # The fingerprint exists (existence check passes) but the UPDATE matches
+    # zero rows: the rule is inactive, or the field was never quarantined /
+    # already un-quarantined — 409, no audit for a mutation that never landed.
+    conn = FakeConn(fetchone=[{"id": 5}], rowcounts=[0])
+    with pytest.raises(writes.ConflictError):
+        writes.unquarantine_field("fp_a", "src_endpoint.ip", conn=conn)
+    assert _statements(conn, "UPDATE rules")  # the UPDATE ran and lost the race
+    assert not _audit_rows(conn)
+    assert "TXN-ROLLBACK" in conn.sql

@@ -708,3 +708,180 @@ def test_deactivate_and_reactivate_endpoints_forward(client, monkeypatch):
     assert r.json() == {"rule_id": 5, "version": 2, "status": "active"}
     assert seen["reactivate"][0] == 5
     assert seen["reactivate"][1]["actor"] == "anonymous"  # default actor
+
+
+# ================= M3 (Task 7): drift surfaces + human un-quarantine ==========
+# Everything below is ADDITIVE — the frozen M1+M2 contracts above are untouched.
+# Same patterns: GETs return the queries-module fixtures verbatim (shapes
+# mirrored key-for-key by Task 10's types.ts); the un-quarantine POST forwards
+# to gateway.writes off the event loop; the fake-conn tests pin the real SQL.
+
+DRIFT_WINDOW_KEYS = {
+    "fingerprint_id", "rule_version", "field", "window_start", "window_end",
+    "events_count", "null_rate", "match_rate", "violation_rate", "shape_dist",
+    "severity", "action_taken",
+}
+
+
+def drift_window_row(**overrides) -> dict:
+    """One drift_windows row as psycopg dict_row returns it (JSONB shape_dist
+    loaded as a dict, real timestamptz datetimes)."""
+    row = {
+        "fingerprint_id": "fp_ssh_denied",
+        "rule_version": 3,
+        "field": "src_endpoint.ip",
+        "window_start": datetime(2026, 9, 21, 12, 0, 0, tzinfo=UTC),
+        "window_end": datetime(2026, 9, 21, 12, 15, 0, tzinfo=UTC),
+        "events_count": 240,
+        "null_rate": 0.012,
+        "match_rate": 0.988,
+        "violation_rate": 0.0,
+        "shape_dist": {"ipv4": 230, "int": 8},
+        "severity": "minor",
+        "action_taken": "alert",
+    }
+    row.update(overrides)
+    return row
+
+
+# ---------- GET /api/drift/metrics ----------
+
+def test_drift_metrics_shape(client, queries, monkeypatch):
+    rows = [drift_window_row()]
+    monkeypatch.setattr(queries, "fetch_drift_metrics", lambda: rows)
+    r = client.get("/api/drift/metrics")
+    assert r.status_code == 200
+    assert r.json() == {"metrics": [jsonable(rows[0])]}
+    assert set(r.json()["metrics"][0]) == DRIFT_WINDOW_KEYS  # exact keys
+
+
+# ---------- GET /api/drift/alerts (controller P-4: one discriminated list) ----
+
+def test_drift_alerts_shape_both_kinds(client, queries, monkeypatch):
+    alerts = [
+        dict(drift_window_row(severity="severe", action_taken="field_quarantined"),
+             kind="window"),
+        dict(audit_row(action="field_quarantined", actor="drift"), kind="audit"),
+        dict(audit_row(action="field_unquarantined", actor="amy", id=42), kind="audit"),
+    ]
+    monkeypatch.setattr(queries, "fetch_drift_alerts", lambda: alerts)
+    r = client.get("/api/drift/alerts")
+    assert r.status_code == 200
+    assert r.json() == {"alerts": [jsonable(a) for a in alerts]}
+    # window rows: metric shape + the P-4 discriminator; audit rows: audit shape + it
+    assert set(r.json()["alerts"][0]) == DRIFT_WINDOW_KEYS | {"kind"}
+    assert r.json()["alerts"][0]["kind"] == "window"
+    assert set(r.json()["alerts"][1]) == AUDIT_ROW_KEYS | {"kind"}
+    assert r.json()["alerts"][1]["kind"] == "audit"
+    assert r.json()["alerts"][2]["kind"] == "audit"  # any actor, per P-4
+
+
+# ---------- drift read helpers over a fake conn (real SQL pinned) ----------
+
+def test_fetch_drift_metrics_latest_window_per_field(queries, monkeypatch):
+    conn = _FakeRowsConn(fetchall=[[drift_window_row()]])
+    monkeypatch.setattr(queries, "_connect", lambda: conn)
+    assert queries.fetch_drift_metrics() == [drift_window_row()]
+    # LATEST window per (fingerprint_id, field): DISTINCT ON over window_start DESC
+    assert "DISTINCT ON (fingerprint_id, field)" in conn.sql[0]
+    assert "FROM drift_windows" in conn.sql[0]
+    assert "ORDER BY fingerprint_id, field, window_start DESC LIMIT %s" in conn.sql[0]
+    assert conn.params[0] == (50,)  # DEFAULT_LIMIT through the clamp
+
+
+def test_fetch_drift_alerts_queries_both_sources_and_clamps(queries, monkeypatch):
+    conn = _FakeRowsConn(fetchall=[
+        [drift_window_row()],
+        [audit_row(action="field_quarantined", actor="drift")],
+    ])
+    monkeypatch.setattr(queries, "_connect", lambda: conn)
+    out = queries.fetch_drift_alerts(limit=10**9)  # nonsense limit -> clamped
+    assert len(conn.sql) == 2  # BOTH sources: drift_windows, then audit_log
+    assert "FROM drift_windows" in conn.sql[0]
+    assert "severity IN ('minor', 'moderate', 'severe')" in conn.sql[0]
+    assert "ORDER BY window_start DESC LIMIT %s" in conn.sql[0]
+    assert "FROM audit_log" in conn.sql[1]
+    assert ("action IN ('field_quarantined', 'field_unquarantined', "
+            "'rule_deactivated')") in conn.sql[1]
+    assert "ORDER BY id DESC LIMIT %s" in conn.sql[1]
+    assert conn.params[0] == (500,) and conn.params[1] == (500,)
+    assert [row["kind"] for row in out] == ["window", "audit"]  # P-4 discriminator
+
+
+def test_fetch_drift_alerts_merges_latest_first_across_sources(queries, monkeypatch):
+    new_window = drift_window_row(window_start=datetime(2026, 9, 21, 13, 0, tzinfo=UTC))
+    old_window = drift_window_row(field="dst_endpoint.ip",
+                                  window_start=datetime(2026, 9, 20, 13, 0, tzinfo=UTC))
+    drift_audit = audit_row(action="field_quarantined", actor="drift",
+                            ts=datetime(2026, 9, 21, 12, 30, tzinfo=UTC))
+    human_audit = audit_row(action="field_unquarantined", actor="amy",
+                            ts=datetime(2026, 9, 19, 9, 0, tzinfo=UTC))
+    conn = _FakeRowsConn(fetchall=[[new_window, old_window],
+                                   [drift_audit, human_audit]])
+    monkeypatch.setattr(queries, "_connect", lambda: conn)
+    out = queries.fetch_drift_alerts()
+    # ONE list, latest first across both sources (window_start vs ts as the key)
+    assert [row["kind"] for row in out] == ["window", "audit", "window", "audit"]
+    assert out[0]["window_start"] == new_window["window_start"]
+    assert out[1]["ts"] == drift_audit["ts"]
+    assert out[3]["ts"] == human_audit["ts"]
+
+    capped = _FakeRowsConn(fetchall=[[new_window, old_window],
+                                     [drift_audit, human_audit]])
+    monkeypatch.setattr(queries, "_connect", lambda: capped)
+    assert len(queries.fetch_drift_alerts(limit=1)) == 1  # merged list is capped too
+
+
+# ---------- POST /api/rules/{fp}/unquarantine (human override) ----------
+
+def test_unquarantine_endpoint_forwards_and_runs_in_worker_thread(client, monkeypatch):
+    import threading
+
+    from gateway import writes
+
+    seen = {}
+
+    def fake(fp, field, **kwargs):
+        seen["fp"], seen["field"], seen["kwargs"] = fp, field, kwargs
+        seen["main_thread"] = threading.current_thread() is threading.main_thread()
+        return {"fingerprint_id": fp, "field": field, "quarantined_fields": []}
+
+    monkeypatch.setattr(writes, "unquarantine_field", fake)
+    r = client.post("/api/rules/fp_ssh_denied/unquarantine",
+                    json={"field": "src_endpoint.ip", "actor": "amy",
+                          "reason": "false positive"})
+    assert r.status_code == 200
+    assert r.json() == {"fingerprint_id": "fp_ssh_denied",
+                        "field": "src_endpoint.ip", "quarantined_fields": []}
+    assert (seen["fp"], seen["field"]) == ("fp_ssh_denied", "src_endpoint.ip")
+    assert seen["kwargs"] == {"actor": "amy", "reason": "false positive"}
+    assert seen["main_thread"] is False  # asyncio.to_thread, not the event loop
+
+
+def test_unquarantine_defaults_actor_and_reason(client, monkeypatch):
+    from gateway import writes
+
+    seen = {}
+
+    def fake(fp, field, **kwargs):
+        seen.update(fp=fp, field=field, **kwargs)
+        return {"fingerprint_id": fp, "field": field, "quarantined_fields": ["other"]}
+
+    monkeypatch.setattr(writes, "unquarantine_field", fake)
+    r = client.post("/api/rules/fp_a/unquarantine", json={"field": "src_endpoint.ip"})
+    assert r.status_code == 200
+    assert seen["actor"] == "anonymous" and seen["reason"] is None  # body defaults
+
+
+def test_unquarantine_error_mapping_404_and_409(client, monkeypatch):
+    from gateway import writes
+
+    monkeypatch.setattr(writes, "unquarantine_field",
+                        _raises(writes.NotFoundError("unknown fingerprint")))
+    assert client.post("/api/rules/fp_none/unquarantine",
+                       json={"field": "x"}).status_code == 404
+
+    monkeypatch.setattr(writes, "unquarantine_field",
+                        _raises(writes.ConflictError("not quarantined")))
+    assert client.post("/api/rules/fp_a/unquarantine",
+                       json={"field": "x"}).status_code == 409

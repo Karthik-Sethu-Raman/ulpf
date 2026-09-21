@@ -245,3 +245,62 @@ def fetch_audit(fingerprint=None, limit=DEFAULT_LIMIT):
             (fingerprint, fingerprint, limit),
         )
         return cur.fetchall()
+
+
+# --- M3 drift surfaces (Task 7; SELECT arrives via 003's default privileges) ----
+
+_DRIFT_WINDOW_COLUMNS = (
+    "fingerprint_id, rule_version, field, window_start, window_end, events_count, "
+    "null_rate, match_rate, violation_rate, shape_dist, severity, action_taken"
+)
+
+
+def fetch_drift_metrics(limit=DEFAULT_LIMIT) -> list[dict]:
+    """GET /api/drift/metrics rows: the LATEST closed window per
+    (fingerprint_id, field) — DISTINCT ON over window_start DESC — clamp-capped.
+    shape_dist is JSONB, so dict_row hands back a dict natively (no unwrap)."""
+    limit = clamp_limit(limit)
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"SELECT DISTINCT ON (fingerprint_id, field) {_DRIFT_WINDOW_COLUMNS} "
+            "FROM drift_windows "
+            "ORDER BY fingerprint_id, field, window_start DESC LIMIT %s",
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+def _alert_recency(row: dict):
+    """Latest-first merge key across the two alert sources (P-4): a window row
+    is as recent as its window_start, an audit row as its ts."""
+    return row["window_start"] if "window_start" in row else row["ts"]
+
+
+def fetch_drift_alerts(limit=DEFAULT_LIMIT) -> list[dict]:
+    """GET /api/drift/alerts rows — controller ruling P-4's kind-discriminated
+    union, rendered by the web feed as ONE list: "window" rows are
+    drift_windows with severity minor/moderate/severe (the row IS the alert);
+    "audit" rows are audit_log actions field_quarantined/field_unquarantined/
+    rule_deactivated from ANY actor (drift's enforcement or a human override).
+    Both sources are fetched latest-first and clamp-capped, then merged into a
+    single latest-first list capped at the same limit. The severity/action
+    IN-lists are module-controlled vocabulary (never request input), so they
+    stay literals — the _STATUS_KEYS / samples-role style."""
+    limit = clamp_limit(limit)
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {_DRIFT_WINDOW_COLUMNS} FROM drift_windows "
+            "WHERE severity IN ('minor', 'moderate', 'severe') "
+            "ORDER BY window_start DESC LIMIT %s",
+            (limit,),
+        )
+        windows = [dict(row, kind="window") for row in cur.fetchall()]
+        cur.execute(
+            "SELECT id, ts, actor, action, entity, detail FROM audit_log "
+            "WHERE action IN ('field_quarantined', 'field_unquarantined', "
+            "'rule_deactivated') "
+            "ORDER BY id DESC LIMIT %s",
+            (limit,),
+        )
+        audits = [dict(row, kind="audit") for row in cur.fetchall()]
+    return sorted(windows + audits, key=_alert_recency, reverse=True)[:limit]

@@ -99,6 +99,12 @@ class ManualBody(BaseModel):
     confidence: float | None = None
 
 
+class UnquarantineBody(BaseModel):
+    field: str
+    actor: str = "anonymous"
+    reason: str | None = None
+
+
 def _write_http_error(exc: writes.WriteError) -> HTTPException:
     """writes.* typed errors -> the API contract: 404 unknown, 409 conflict,
     422 failed validation carrying the gate's checks + notes (the Review UI
@@ -233,6 +239,28 @@ def build_app(queries_module=queries, writes_module=writes,
         try:
             return await asyncio.to_thread(
                 writes_module.reactivate_rule, rule_id,
+                actor=body.actor, reason=body.reason)
+        except writes.WriteError as exc:
+            raise _write_http_error(exc) from exc
+
+    # ---------- M3: drift surfaces + human un-quarantine (Task 7) ----------
+
+    @app.get("/api/drift/metrics")
+    async def drift_metrics():
+        return {"metrics": await asyncio.to_thread(queries_module.fetch_drift_metrics)}
+
+    @app.get("/api/drift/alerts")
+    async def drift_alerts():
+        # P-4: one kind-discriminated list — "window" rows (drift_windows with
+        # minor/moderate/severe severity) merged with "audit" rows (quarantine/
+        # un-quarantine/deactivate actions, any actor), latest first.
+        return {"alerts": await asyncio.to_thread(queries_module.fetch_drift_alerts)}
+
+    @app.post("/api/rules/{fingerprint_id}/unquarantine")
+    async def unquarantine(fingerprint_id: str, body: UnquarantineBody):
+        try:
+            return await asyncio.to_thread(
+                writes_module.unquarantine_field, fingerprint_id, body.field,
                 actor=body.actor, reason=body.reason)
         except writes.WriteError as exc:
             raise _write_http_error(exc) from exc
