@@ -12,16 +12,9 @@
 // Air-gap rules: same-origin /api only, system fonts, zero external requests.
 import { useCallback, useEffect, useState } from 'react'
 import { getEvents } from './api'
-import type { EventRow, OcsfEndpoint } from './types'
+import type { EventRow } from './types'
+import { endpointIp, formatTime } from './cells'
 import TraceDrawer from './components/TraceDrawer'
-
-function endpointIp(ep: OcsfEndpoint | null): string {
-  return ep?.ip ?? '—'
-}
-
-function formatTime(iso: string): string {
-  return new Date(iso).toLocaleTimeString()
-}
 
 /** The Events tab: filter bar + current-view table + traceability drawer. */
 export default function Events() {

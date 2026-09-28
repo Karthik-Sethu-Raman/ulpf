@@ -6,7 +6,8 @@
 // prod: Caddy) — the gateway ships no CORS.
 import { useCallback, useEffect, useState } from 'react'
 import { getStats } from './api'
-import type { EventRow, OcsfEndpoint, Stats } from './types'
+import type { EventRow, Stats } from './types'
+import { endpointIp, formatTime } from './cells'
 import { useEventStream } from './useEventStream'
 import ReviewQueue from './ReviewQueue'
 import Rules from './Rules'
@@ -30,14 +31,6 @@ function parsedPercent(byStatus: Stats['by_status']): string {
     byStatus.parsed + byStatus.unparsed + byStatus.parse_error + byStatus.quarantined
   if (total === 0) return '—'
   return `${Math.round((byStatus.parsed / total) * 100)}%`
-}
-
-function endpointIp(ep: OcsfEndpoint | null): string {
-  return ep?.ip ?? '—'
-}
-
-function formatTime(iso: string): string {
-  return new Date(iso).toLocaleTimeString()
 }
 
 interface StatCard {
