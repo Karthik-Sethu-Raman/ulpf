@@ -1,6 +1,7 @@
-// web/src/App.tsx — the three-tab M2 shell: Overview (the M1 dashboard),
-// Review Queue (Task 8 human review loop) and the Rules registry + audit
-// trail (Task 9).
+// web/src/App.tsx — the five-tab M3 shell (spec §12's five pages, in spec
+// order): Overview (the M1 dashboard), Review Queue (Task 8 human review
+// loop), the Events browser (Task 9), the Rules registry + audit trail
+// (Task 9) and Drift & Health (Task 10, the fifth page).
 // Tab state is plain useState — no router (air-gapped dashboard: system
 // fonts, zero external requests). Same-origin /api only (dev: Vite proxy,
 // prod: Caddy) — the gateway ships no CORS.
@@ -10,18 +11,22 @@ import type { EventRow, Stats } from './types'
 import { endpointIp, formatTime } from './cells'
 import { useEventStream } from './useEventStream'
 import ReviewQueue from './ReviewQueue'
+import Events from './Events'
 import Rules from './Rules'
+import DriftHealth from './DriftHealth'
 import TraceDrawer from './components/TraceDrawer'
 import './App.css'
 
 const STATS_REFRESH_MS = 5000
 
-type Tab = 'overview' | 'review' | 'rules'
+type Tab = 'overview' | 'review' | 'events' | 'rules' | 'drift'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'review', label: 'Review Queue' },
+  { id: 'events', label: 'Events' },
   { id: 'rules', label: 'Rules' },
+  { id: 'drift', label: 'Drift & Health' },
 ]
 
 /** parsed / (parsed + unparsed + parse_error + quarantined); "—" before any
@@ -171,7 +176,9 @@ export default function App() {
       </nav>
       {tab === 'overview' && <Overview />}
       {tab === 'review' && <ReviewQueue />}
+      {tab === 'events' && <Events />}
       {tab === 'rules' && <Rules />}
+      {tab === 'drift' && <DriftHealth />}
     </div>
   )
 }

@@ -207,3 +207,72 @@ export interface SamplesStatus {
 export interface SamplesListResponse {
   samples: SamplesStatus[]
 }
+
+// --- M3 drift surfaces (Task 7 shapes, mirrored key for key; Task 10) ---------
+
+/** drift_windows.severity CHECK vocabulary (migration 007 / SEVERITIES). */
+export type DriftSeverity = 'none' | 'minor' | 'moderate' | 'severe'
+
+/** drift_windows.action_taken CHECK vocabulary; null when the window's
+ * severity warranted no action ("none", or an already-quarantined field —
+ * the idempotent skip records no action). */
+export type DriftAction = 'alert' | 'field_quarantined' | 'rule_deactivated'
+
+/** One drift_windows row — GET /api/drift/metrics rows carry EXACTLY these
+ * 12 keys (gateway _DRIFT_WINDOW_COLUMNS): the latest closed window per
+ * (fingerprint_id, field). `field` is an OCSF path, 'unmapped.<key>', or
+ * the '__rule__' sentinel; rates are 0..1 REALs, null where the window does
+ * not measure that rate for the field (match_rate is __rule__-only;
+ * violation_rate is null on unmapped rows); shape_dist is the JSONB
+ * shape-class histogram over non-null scalar values ({} when the field
+ * observed no values, null on __rule__ rows); timestamps ISO-8601 strings. */
+export interface DriftMetricRow {
+  fingerprint_id: string
+  rule_version: number
+  field: string
+  window_start: string
+  window_end: string
+  events_count: number
+  null_rate: number | null
+  match_rate: number | null
+  violation_rate: number | null
+  shape_dist: Record<string, number> | null
+  severity: DriftSeverity
+  action_taken: DriftAction | null
+}
+
+/** GET /api/drift/metrics response. */
+export interface DriftMetricsResponse {
+  metrics: DriftMetricRow[]
+}
+
+/** One GET /api/drift/alerts row — ruling P-4's kind-discriminated union:
+ * ONE latest-first merged list the endpoint already ordered (the page
+ * renders it verbatim and never re-merges or re-sorts client-side).
+ * "window" rows carry the drift_windows columns (minor/moderate/severe —
+ * the row IS the alert); "audit" rows carry the audit_log shape with action
+ * field_quarantined / field_unquarantined / rule_deactivated (any actor). */
+export type DriftAlertRow =
+  | (DriftMetricRow & { kind: 'window' })
+  | (AuditRow & { kind: 'audit' })
+
+/** GET /api/drift/alerts response. */
+export interface DriftAlertsResponse {
+  alerts: DriftAlertRow[]
+}
+
+/** POST /api/rules/{fp}/unquarantine body — the human override that removes
+ * one field from the active rule's quarantined_fields (audited, paired in
+ * the same transaction as the mutation). */
+export interface UnquarantineBody {
+  field: string
+  actor?: string
+  reason?: string
+}
+
+/** POST /api/rules/{fp}/unquarantine 200 response — the post-state list. */
+export interface UnquarantineResponse {
+  fingerprint_id: string
+  field: string
+  quarantined_fields: string[]
+}
