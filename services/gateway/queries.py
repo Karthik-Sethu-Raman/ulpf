@@ -170,8 +170,15 @@ def fetch_chain_heads() -> list[dict]:
 
 _RULE_COLUMNS = (
     "id, fingerprint_id, version, pattern, mappings, provenance, confidence, "
-    "status, created_by, created_at, activated_at, deactivated_at, validation"
+    "status, quarantined_fields, created_by, created_at, activated_at, "
+    "deactivated_at, validation"
 )
+# quarantined_fields (ruling P-8): additive 14th key, column order mirroring
+# migration 001's rules table (status, quarantined_fields, created_by). The
+# column has existed since 001 (TEXT[] NOT NULL DEFAULT '{}') and gateway_role
+# holds table-level SELECT, so both rule surfaces gain the key with no grant
+# change — the Drift & Health page gates un-quarantine on the active
+# version's list from GET /api/rules/{fp}.
 
 
 def fetch_rules(status=None):

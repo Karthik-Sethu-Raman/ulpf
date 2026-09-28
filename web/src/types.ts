@@ -114,9 +114,12 @@ export type RuleStatus =
 /** rules.provenance CHECK vocabulary. "slm-edited" marks approve-with-edits. */
 export type RuleProvenance = 'slm' | 'slm-edited' | 'human'
 
-/** GET /api/rules row — EXACTLY these 13 keys (gateway _RULE_COLUMNS).
+/** GET /api/rules row — EXACTLY these 14 keys (gateway _RULE_COLUMNS).
  * `id` doubles as the candidate id in the approve/reject URLs; UUID-ish ids
- * are strings, timestamps ISO-8601 strings. */
+ * are strings, timestamps ISO-8601 strings. `quarantined_fields` mirrors
+ * rules.quarantined_fields TEXT[] (migration 001; additive P-8) — the fields
+ * drift enforcement disabled on this version; the Drift & Health page gates
+ * un-quarantine on the ACTIVE version's list. */
 export interface RuleRow {
   id: number
   fingerprint_id: string
@@ -126,6 +129,7 @@ export interface RuleRow {
   provenance: RuleProvenance
   confidence: number | null
   status: RuleStatus
+  quarantined_fields: string[]
   created_by: string
   created_at: string
   activated_at: string | null

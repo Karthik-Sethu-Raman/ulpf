@@ -2,26 +2,31 @@
 // web/src/DriftHealth.test.tsx — the Drift & Health page tests (M3 Task 10,
 // the fifth §12 page). The './api' module is mocked wholesale (house rule:
 // tests never touch the network); this file's tree imports getDriftMetrics,
-// getDriftAlerts (the page) and postJson (the un-quarantine button).
+// getDriftAlerts, getRuleHistory (the page — the last is the P-8 un-quarantine
+// gate source) and postJson (the un-quarantine button).
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import DriftHealth from './DriftHealth'
-import { getDriftAlerts, getDriftMetrics, postJson } from './api'
+import { getDriftAlerts, getDriftMetrics, getRuleHistory, postJson } from './api'
 import type {
   AuditRow,
   DriftAlertRow,
   DriftMetricRow,
+  RuleHistoryResponse,
+  RuleRow,
   UnquarantineResponse,
 } from './types'
 
 vi.mock('./api', () => ({
   getDriftMetrics: vi.fn(),
   getDriftAlerts: vi.fn(),
+  getRuleHistory: vi.fn(),
   postJson: vi.fn(),
 }))
 
 const mockGetDriftMetrics = vi.mocked(getDriftMetrics)
 const mockGetDriftAlerts = vi.mocked(getDriftAlerts)
+const mockGetRuleHistory = vi.mocked(getRuleHistory)
 const mockPostJson = vi.mocked(postJson)
 
 /** A severe window row for fp-acme-fw / src_endpoint.ip — the firmware-drift
@@ -70,6 +75,35 @@ const unquarantineOk: UnquarantineResponse = {
   quarantined_fields: [],
 }
 
+/** One GET /api/rules/{fp} rule row (all 14 gateway _RULE_COLUMNS keys); the
+ * default is the fp-acme-fw ACTIVE v3 whose quarantined_fields gate the
+ * Un-quarantine button (P-8). */
+function historyRule(overrides: Partial<RuleRow> = {}): RuleRow {
+  return {
+    id: 7,
+    fingerprint_id: 'fp-acme-fw',
+    version: 3,
+    pattern: '^.*?(?P<extension>.*)$',
+    mappings: [{ source_field: 'SRCADDR', ocsf_path: 'src_endpoint.ip' }],
+    provenance: 'slm',
+    confidence: 0.93,
+    status: 'active',
+    quarantined_fields: [],
+    created_by: 'onboarding',
+    created_at: '2026-09-19T09:00:00Z',
+    activated_at: '2026-09-19T09:05:00Z',
+    deactivated_at: null,
+    validation: null,
+    ...overrides,
+  }
+}
+
+/** GET /api/rules/{fp} response for a fingerprint whose ACTIVE rule
+ * quarantines exactly `quarantined` (and nothing else). */
+function ruleHistory(quarantined: string[] = []): RuleHistoryResponse {
+  return { rules: [historyRule({ quarantined_fields: quarantined })], audit: [] }
+}
+
 afterEach(() => {
   cleanup() // vitest without globals does not auto-cleanup RTL renders
   vi.clearAllMocks()
@@ -93,6 +127,7 @@ describe('Drift & Health — Field health', () => {
       ],
     })
     mockGetDriftAlerts.mockResolvedValue({ alerts: [] })
+    mockGetRuleHistory.mockResolvedValue(ruleHistory())
     const { container } = render(<DriftHealth />)
 
     // both feeds load on mount
@@ -138,6 +173,7 @@ describe('Drift & Health — Field health', () => {
       ],
     })
     mockGetDriftAlerts.mockResolvedValue({ alerts: [] })
+    mockGetRuleHistory.mockResolvedValue(ruleHistory())
     render(<DriftHealth />)
     await screen.findByText('__rule__')
 
@@ -162,6 +198,7 @@ describe('Drift & Health — Enforcement feed', () => {
     // contract (P-4) and the page must render the array verbatim — a client
     // re-sort would reorder these rows.
     mockGetDriftMetrics.mockResolvedValue({ metrics: [metricRow()] })
+    mockGetRuleHistory.mockResolvedValue(ruleHistory())
     mockGetDriftAlerts.mockResolvedValue({
       alerts: [
         windowAlert({ window_start: '2026-09-22T10:00:00Z', severity: 'severe' }),
@@ -216,58 +253,30 @@ describe('Drift & Health — Enforcement feed', () => {
 })
 
 describe('Drift & Health — Un-quarantine', () => {
-  it('shows the button only on currently-quarantined fields (latest audit transition wins), POSTs {field, actor:"ui"} and refetches both feeds', async () => {
+  it("gates on the ACTIVE rule version's quarantined_fields (P-8), POSTs {field, actor:'ui'} and refetches feeds + histories", async () => {
     const metrics = [
       metricRow({ field: 'src_endpoint.ip' }),
       metricRow({ field: 'dst_endpoint.ip' }),
     ]
-    // Latest-first: src was un-quarantined AFTER its quarantine (not
-    // quarantined anymore); dst's latest transition is the quarantine.
-    const initialAlerts: DriftAlertRow[] = [
-      auditAlert({
-        id: 46,
-        ts: '2026-09-22T11:00:00Z',
-        actor: 'karthik',
-        action: 'field_unquarantined',
-        detail: { field: 'src_endpoint.ip', rule_id: 3, version: 3 },
-      }),
-      auditAlert({
-        id: 45,
-        ts: '2026-09-22T10:30:00Z',
-        action: 'field_quarantined',
-        detail: { field: 'dst_endpoint.ip', rule_id: 3, version: 3 },
-      }),
-      auditAlert({
-        id: 44,
-        ts: '2026-09-22T10:00:00Z',
-        action: 'field_quarantined',
-        detail: { field: 'src_endpoint.ip', rule_id: 3, version: 3 },
-      }),
-    ]
     mockGetDriftMetrics.mockResolvedValue({ metrics })
-    mockGetDriftAlerts.mockResolvedValueOnce({ alerts: initialAlerts })
-    // post-click refetch: the latest dst transition is now the un-quarantine
-    mockGetDriftAlerts.mockResolvedValueOnce({
-      alerts: [
-        auditAlert({
-          id: 47,
-          ts: '2026-09-22T11:05:00Z',
-          actor: 'ui',
-          action: 'field_unquarantined',
-          detail: { field: 'dst_endpoint.ip', rule_id: 3, version: 3 },
-        }),
-        ...initialAlerts,
-      ],
-    })
+    mockGetDriftAlerts.mockResolvedValue({ alerts: [] }) // display-only now
+    // the ACTIVE rule quarantines exactly dst_endpoint.ip (newest first)
+    mockGetRuleHistory.mockResolvedValueOnce(
+      ruleHistory(['dst_endpoint.ip']),
+    )
+    // post-click refetch: the active rule quarantines nothing anymore
+    mockGetRuleHistory.mockResolvedValueOnce(ruleHistory([]))
     mockPostJson.mockResolvedValueOnce(unquarantineOk)
     render(<DriftHealth />)
-    // the field shows in its table row AND the enforcement feed
+    // the field shows in its table row
     await screen.findAllByText('dst_endpoint.ip')
 
     // exactly one button — on the dst row, not the src row
     const buttons = screen.getAllByRole('button', { name: 'Un-quarantine' })
     expect(buttons).toHaveLength(1)
     expect(buttons[0]?.closest('tr')?.textContent).toContain('dst_endpoint.ip')
+    // the gate asked for the (single) metrics fingerprint's rule history
+    expect(mockGetRuleHistory).toHaveBeenCalledWith('fp-acme-fw')
 
     fireEvent.click(buttons[0])
     await waitFor(() => {
@@ -276,26 +285,60 @@ describe('Drift & Health — Un-quarantine', () => {
         { field: 'dst_endpoint.ip', actor: 'ui' },
       )
     })
-    // both feeds were refetched and the button left with the new fold
+    // everything was refetched and the button left with the recomputed gate
     await waitFor(() => {
       expect(screen.queryByRole('button', { name: 'Un-quarantine' })).toBeNull()
     })
     expect(mockGetDriftMetrics).toHaveBeenCalledTimes(2)
     expect(mockGetDriftAlerts).toHaveBeenCalledTimes(2)
+    expect(mockGetRuleHistory).toHaveBeenCalledTimes(2)
+  })
+
+  it('fetches one rule history per DISTINCT metrics fingerprint', async () => {
+    mockGetDriftMetrics.mockResolvedValue({
+      metrics: [
+        metricRow({ field: 'src_endpoint.ip' }),
+        metricRow({ field: 'dst_endpoint.ip' }), // same fp — deduped
+        metricRow({ fingerprint_id: 'fp-acme-db', field: 'src_endpoint.ip' }),
+      ],
+    })
+    mockGetDriftAlerts.mockResolvedValue({ alerts: [] })
+    mockGetRuleHistory.mockResolvedValue(ruleHistory())
+    render(<DriftHealth />)
+    await screen.findAllByText('fp-acme-db')
+
+    expect(mockGetRuleHistory.mock.calls).toEqual([
+      ['fp-acme-fw'],
+      ['fp-acme-db'],
+    ])
+  })
+
+  it('gates nothing when the newest version is inactive — the ACTIVE one decides', async () => {
+    mockGetDriftMetrics.mockResolvedValue({
+      metrics: [metricRow({ field: 'src_endpoint.ip' })],
+    })
+    mockGetDriftAlerts.mockResolvedValue({ alerts: [] })
+    mockGetRuleHistory.mockResolvedValue({
+      rules: [
+        // newest (v4) deactivated but still carrying the field in its list;
+        // the active v3 quarantines nothing — the gate follows the ACTIVE one
+        historyRule({ version: 4, status: 'deactivated', quarantined_fields: ['src_endpoint.ip'] }),
+        historyRule({ version: 3 }),
+      ],
+      audit: [],
+    })
+    render(<DriftHealth />)
+    await screen.findAllByText('src_endpoint.ip')
+
+    expect(screen.queryByRole('button', { name: 'Un-quarantine' })).toBeNull()
   })
 
   it('shows a row-level error banner when the POST fails (409: not quarantined)', async () => {
     mockGetDriftMetrics.mockResolvedValue({
       metrics: [metricRow({ field: 'dst_endpoint.ip' })],
     })
-    mockGetDriftAlerts.mockResolvedValue({
-      alerts: [
-        auditAlert({
-          action: 'field_quarantined',
-          detail: { field: 'dst_endpoint.ip', rule_id: 3, version: 3 },
-        }),
-      ],
-    })
+    mockGetDriftAlerts.mockResolvedValue({ alerts: [] })
+    mockGetRuleHistory.mockResolvedValue(ruleHistory(['dst_endpoint.ip']))
     mockPostJson.mockRejectedValueOnce(
       new Error(
         'POST /api/rules/fp-acme-fw/unquarantine failed: field ' +
@@ -337,6 +380,7 @@ describe('Drift & Health — Extension opportunities', () => {
       ],
     })
     mockGetDriftAlerts.mockResolvedValue({ alerts: [] })
+    mockGetRuleHistory.mockResolvedValue(ruleHistory())
     render(<DriftHealth />)
     // the key shows in its table row AND its opportunity card
     await screen.findAllByText('unmapped.SRCADDR')
@@ -362,6 +406,7 @@ describe('Drift & Health — load failure', () => {
     expect(banner.textContent).toMatch(/500/)
 
     mockGetDriftMetrics.mockResolvedValueOnce({ metrics: [metricRow()] })
+    mockGetRuleHistory.mockResolvedValue(ruleHistory())
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
     expect(await screen.findByText('fp-acme-fw')).not.toBeNull()
     expect(screen.queryByRole('alert')).toBeNull()

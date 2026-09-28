@@ -283,13 +283,25 @@ def test_r9_current_view_predicate_in_every_normalized_query(queries):
 
 RULE_ROW_KEYS = {
     "id", "fingerprint_id", "version", "pattern", "mappings", "provenance", "confidence",
-    "status", "created_by", "created_at", "activated_at", "deactivated_at", "validation",
+    "status", "quarantined_fields", "created_by", "created_at", "activated_at",
+    "deactivated_at", "validation",
 }
 AUDIT_ROW_KEYS = {"id", "ts", "actor", "action", "entity", "detail"}
 
+# P-8: the additive quarantined_fields column rides BOTH rule surfaces
+# (fetch_rules, fetch_rule_history) — the full SELECT list is pinned literally
+# (the services/pipeline/tests/test_rules.py style) so a regression that drops
+# the key fails here, not in the Drift & Health page's gating.
+RULE_COLUMNS_SQL = (
+    "SELECT id, fingerprint_id, version, pattern, mappings, provenance, "
+    "confidence, status, quarantined_fields, created_by, created_at, "
+    "activated_at, deactivated_at, validation FROM rules"
+)
+
 
 def rule_row(**overrides) -> dict:
-    """One RuleRow as psycopg dict_row returns it (JSONB loaded, real datetimes)."""
+    """One RuleRow as psycopg dict_row returns it (JSONB loaded, TEXT[] as a
+    Python list, real datetimes)."""
     row = {
         "id": 7,
         "fingerprint_id": "fp_ssh_denied",
@@ -299,6 +311,7 @@ def rule_row(**overrides) -> dict:
         "provenance": "slm",
         "confidence": 0.93,
         "status": "active",
+        "quarantined_fields": [],
         "created_by": "onboarding",
         "created_at": datetime(2026, 9, 19, 9, 0, 0, tzinfo=UTC),
         "activated_at": datetime(2026, 9, 19, 9, 5, 0, tzinfo=UTC),
@@ -397,7 +410,8 @@ def test_rules_status_filter_forwarded(client, queries, monkeypatch):
 
 
 def test_rule_history_shape(client, queries, monkeypatch):
-    body = {"rules": [rule_row(version=3), rule_row(version=2, status="superseded")],
+    body = {"rules": [rule_row(version=3, quarantined_fields=["dst_endpoint.ip"]),
+                      rule_row(version=2, status="superseded")],
             "audit": [audit_row()]}
     monkeypatch.setattr(queries, "fetch_rule_history", lambda fp: body)
     r = client.get("/api/rules/fp_ssh_denied")
@@ -406,6 +420,9 @@ def test_rule_history_shape(client, queries, monkeypatch):
         "rules": [jsonable(row) for row in body["rules"]],
         "audit": [jsonable(row) for row in body["audit"]],
     }
+    # P-8: TEXT[] reaches the wire as a JSON array of strings — the Drift &
+    # Health page's un-quarantine gate consumes this exact value.
+    assert r.json()["rules"][0]["quarantined_fields"] == ["dst_endpoint.ip"]
 
 
 # ---------- GET /api/onboarding/samples ----------
@@ -466,6 +483,7 @@ def test_fetch_rules_filters_status_and_orders(queries, monkeypatch):
     conn = _FakeRowsConn(fetchall=[[rule_row()]])
     monkeypatch.setattr(queries, "_connect", lambda: conn)
     assert queries.fetch_rules("pending_review") == [rule_row()]
+    assert RULE_COLUMNS_SQL in conn.sql[0]  # P-8: quarantined_fields rides the list surface
     assert "WHERE (%s::text IS NULL OR status = %s)" in conn.sql[0]
     assert "ORDER BY fingerprint_id, version DESC" in conn.sql[0]
     assert conn.params[0] == ("pending_review", "pending_review")
@@ -480,6 +498,7 @@ def test_fetch_rule_history_returns_rules_and_scoped_audit(queries, monkeypatch)
     body = queries.fetch_rule_history("fp_ssh_denied")
     assert body["rules"][0]["version"] == 3  # versions newest-first
     assert body["audit"] == [audit_row()]
+    assert RULE_COLUMNS_SQL in conn.sql[0]  # P-8: ...and the history surface
     assert "ORDER BY version DESC" in conn.sql[0]
     assert "FROM audit_log" in conn.sql[1] and "ORDER BY id DESC LIMIT 200" in conn.sql[1]
     assert conn.params[1] == ("fp_ssh_denied",)

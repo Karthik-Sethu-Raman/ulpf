@@ -3,29 +3,30 @@
 // the merged enforcement/alert feed, and unmapped.* extension opportunities.
 //
 // Two fetches fire together on mount and after every action (one effect, one
-// alive flag, Promise.all — the page's un-quarantine gating needs BOTH feeds,
-// so they load or fail as a unit with a single Retry banner). The alerts
-// endpoint (ruling P-4) already merges window rows and audit actions into ONE
-// latest-first list — this page renders that array verbatim, discriminated
-// only by the `kind` field, and never re-merges or re-sorts client-side.
+// alive flag, Promise.all — one shared Retry banner when either fails). The
+// alerts endpoint (ruling P-4) already merges window rows and audit actions
+// into ONE latest-first list — this page renders that array verbatim,
+// discriminated only by the `kind` field, and never re-merges or re-sorts
+// client-side.
 //
-// Un-quarantine gating — DEVIATION from the task context, documented in the
-// Task-10 report: GET /api/rules/{fp} (getRuleHistory) does NOT actually
-// return rules.quarantined_fields (gateway _RULE_COLUMNS has 13 keys, none of
-// them quarantined_fields; Python is out of this task's scope). Instead the
-// button is gated by a latest-wins fold over the alert feed's audit rows:
-// enforce.py and writes.py write field_quarantined / field_unquarantined
-// audit rows ONLY on real transitions (both mutations carry TOCTOU predicates
-// and never audit a no-op), so the most recent transition per
-// (fingerprint, field) — the first one seen in the latest-first list — IS the
-// field's current quarantine state. Bounded by the endpoint's row cap: a
-// quarantine whose transitions have scrolled out of the feed cannot be
-// un-quarantined from this page.
+// Un-quarantine gating (ruling P-8): once the metrics land, one
+// getRuleHistory(fp) per DISTINCT fingerprint they name supplies the ACTIVE
+// version's quarantined_fields — the authoritative quarantine state (the
+// gateway now exposes the column on every rule row; migration 001's
+// rules_one_active partial unique index guarantees at most one active
+// version per fingerprint, and the un-quarantine POST itself 409s unless the
+// rule is active, so a fingerprint with no active version gates nothing).
+// The histories load with the feeds or fail the page as a unit.
 //
 // Air-gap rules: same-origin /api only, system fonts, zero external requests.
 import { useCallback, useEffect, useState } from 'react'
-import { getDriftAlerts, getDriftMetrics, postJson } from './api'
-import type { AuditRow, DriftAlertRow, DriftMetricRow } from './types'
+import { getDriftAlerts, getDriftMetrics, getRuleHistory, postJson } from './api'
+import type {
+  AuditRow,
+  DriftAlertRow,
+  DriftMetricRow,
+  RuleHistoryResponse,
+} from './types'
 import { formatTime } from './cells'
 
 function errorMessage(err: unknown): string {
@@ -60,28 +61,19 @@ function auditField(row: AuditRow): string | undefined {
   return typeof detail.field === 'string' ? detail.field : undefined
 }
 
-/** Currently-quarantined fields per fingerprint — latest-wins fold over the
- * merged feed's audit rows (see the header comment: the first transition per
- * (fingerprint, field) in the latest-first list is the current state). */
-function quarantinedFields(
-  alerts: DriftAlertRow[],
+/** Currently-quarantined fields per fingerprint, from each fingerprint's
+ * rule history (ruling P-8): the ACTIVE version's quarantined_fields — not
+ * the newest version's, which may be a deactivated row still carrying the
+ * list. Fingerprints with no active version gate nothing. */
+function quarantinedByFingerprint(
+  histories: RuleHistoryResponse[],
 ): Map<string, Set<string>> {
-  const seen = new Set<string>() // 'fp\u0000field' already folded (latest)
   const quarantined = new Map<string, Set<string>>()
-  for (const row of alerts) {
-    if (row.kind !== 'audit') continue
-    const field = auditField(row)
-    if (field === undefined) continue
-    const key = `${row.entity}\u0000${field}`
-    if (seen.has(key)) continue // an older transition — already superseded
-    seen.add(key)
-    if (row.action !== 'field_quarantined') continue // latest = unquarantined
-    let fields = quarantined.get(row.entity)
-    if (fields === undefined) {
-      fields = new Set()
-      quarantined.set(row.entity, fields)
+  for (const { rules } of histories) {
+    const active = rules.find((rule) => rule.status === 'active')
+    if (active !== undefined) {
+      quarantined.set(active.fingerprint_id, new Set(active.quarantined_fields))
     }
-    fields.add(field)
   }
   return quarantined
 }
@@ -96,8 +88,9 @@ function alertKey(row: DriftAlertRow): string {
 
 /** One Field-health row: the latest closed window for a (fingerprint, field).
  * The Un-quarantine button (human override, actor "ui") shows only while the
- * field is currently quarantined; its POST refetches both feeds so the fold,
- * the badges and the enforcement feed all move together. */
+ * field sits in the active rule's quarantined_fields (P-8); its POST
+ * refetches the feeds and histories so the gate, the badges and the
+ * enforcement feed all move together. */
 function FieldHealthRow({
   row,
   quarantined,
@@ -117,7 +110,7 @@ function FieldHealthRow({
       field: row.field,
       actor: 'ui',
     })
-      .then(() => refresh()) // refetch — the fold recomputes, the button leaves
+      .then(() => refresh()) // refetch — the gate recomputes, the button leaves
       .catch((err: unknown) => setActionError(errorMessage(err)))
       .finally(() => setBusy(false))
   }
@@ -168,18 +161,31 @@ function FieldHealthRow({
 export default function DriftHealth() {
   const [metrics, setMetrics] = useState<DriftMetricRow[] | null>(null)
   const [alerts, setAlerts] = useState<DriftAlertRow[] | null>(null)
+  const [quarantined, setQuarantined] = useState<Map<string, Set<string>> | null>(
+    null,
+  )
   const [error, setError] = useState<string | null>(null)
   const [reloadTick, setReloadTick] = useState(0)
 
   useEffect(() => {
     let alive = true
-    // Both feeds as a unit: the un-quarantine gating (the audit fold) needs
-    // the alerts even though the button lives on the metrics table.
+    // Both feeds as a unit; the rule histories follow the metrics (their
+    // fingerprints come from them) and the un-quarantine gate (P-8) loads
+    // with the rest or fails the page — one shared Retry banner.
     Promise.all([getDriftMetrics(), getDriftAlerts()])
       .then(([metricsRes, alertsRes]) => {
+        const fingerprints = [
+          ...new Set(metricsRes.metrics.map((row) => row.fingerprint_id)),
+        ]
+        return Promise.all(fingerprints.map((fp) => getRuleHistory(fp))).then(
+          (histories) => [metricsRes, alertsRes, histories] as const,
+        )
+      })
+      .then(([metricsRes, alertsRes, histories]) => {
         if (!alive) return
         setMetrics(metricsRes.metrics)
         setAlerts(alertsRes.alerts)
+        setQuarantined(quarantinedByFingerprint(histories))
         setError(null)
       })
       .catch((err: unknown) => {
@@ -193,8 +199,6 @@ export default function DriftHealth() {
 
   const refresh = useCallback(() => setReloadTick((n) => n + 1), [])
 
-  const quarantined =
-    alerts === null ? new Map<string, Set<string>>() : quarantinedFields(alerts)
   const opportunities =
     metrics === null ? null : metrics.filter((r) => r.field.startsWith('unmapped.'))
 
@@ -255,7 +259,7 @@ export default function DriftHealth() {
                     key={`${row.fingerprint_id}:${row.rule_version}:${row.field}`}
                     row={row}
                     quarantined={quarantined
-                      .get(row.fingerprint_id)
+                      ?.get(row.fingerprint_id)
                       ?.has(row.field) ?? false}
                     refresh={refresh}
                   />

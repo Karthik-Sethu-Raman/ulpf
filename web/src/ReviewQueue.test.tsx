@@ -81,6 +81,7 @@ function pendingRule(overrides: Partial<RuleRow> = {}): RuleRow {
     provenance: 'slm',
     confidence: 0.87,
     status: 'pending_review',
+    quarantined_fields: [], // P-8 additive key — empty on this fixture
     created_by: 'onboarding',
     created_at: '2026-09-19T09:05:00Z',
     activated_at: null,
