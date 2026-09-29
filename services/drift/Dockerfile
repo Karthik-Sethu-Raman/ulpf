@@ -21,6 +21,7 @@ COPY services/drift/__init__.py /app/drift/__init__.py
 COPY services/drift/config.py /app/drift/config.py
 COPY services/drift/windows.py /app/drift/windows.py
 COPY services/drift/detect.py /app/drift/detect.py
+COPY services/drift/enforce.py /app/drift/enforce.py
 COPY services/drift/store.py /app/drift/store.py
 COPY services/drift/app.py /app/drift/app.py
 
