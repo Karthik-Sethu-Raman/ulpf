@@ -4,6 +4,7 @@
 # record_windows row assembly, and worst-first scan enforcement. Everything is
 # pinned through a recording fake conn/cursor or monkeypatched collaborators;
 # NEVER a live DB.
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -133,7 +134,12 @@ def test_quarantine_field_true_audits_with_actor_drift_and_detail():
     assert params[0] == "drift" and params[1] == "field_quarantined"
     assert params[2] == "fp_a"
     assert _unwrap(params[3]) == {"field": "dst_endpoint.ip", "rule_id": 9,
-                                  "version": 3, "window_start": _ts(90)}
+                                  "version": 3, "window_start": _ts(90).isoformat()}
+    # The detail is JSONB: every value must survive plain json.dumps — a raw
+    # datetime raised TypeError inside psycopg's Json() and rolled the paired
+    # mutation back (observed live in Task 12; fake conns never serialize, so
+    # this pin is the regression guard for that exact bug class).
+    json.dumps(_unwrap(params[3]))
     # UPDATE and its audit pair inside ONE transaction (the writes.py pairing).
     assert conn.txns_opened == 1
     assert conn.sql[0] == "TXN-START" and conn.sql[-1] == "TXN-COMMIT"
@@ -178,7 +184,11 @@ def test_deactivate_rule_true_audits_with_actor_drift():
                     if s.startswith("INSERT INTO audit_log")]
     assert params[0] == "drift" and params[1] == "rule_deactivated"
     assert params[2] == "fp_a"
-    assert _unwrap(params[3]) == {"rule_id": 11, "version": 4, "window_start": _ts(30)}
+    # window_start rides as ISO-8601 (JSONB detail — see the quarantine test).
+    detail = _unwrap(params[3])
+    assert detail == {"rule_id": 11, "version": 4,
+                      "window_start": _ts(30).isoformat()}
+    json.dumps(detail)
 
 
 # --- record_windows: findings overlaid onto the measured rows ---------------------

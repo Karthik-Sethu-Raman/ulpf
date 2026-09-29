@@ -69,9 +69,13 @@ def quarantine_field(conn: psycopg.Connection, rule: ActiveDriftRule, field: str
             log.info("quarantine no-op for %s v%d field %s (already quarantined "
                      "or rule inactive)", rule.fingerprint_id, rule.version, field)
             return False
+        # window_start is JSON-serialized as ISO-8601: the audit detail is
+        # JSONB, and psycopg's Json() does NOT convert datetime (observed live
+        # in Task 12: the deactivate audit raised TypeError and rolled the
+        # paired mutation back).
         _audit(cur, "field_quarantined", rule.fingerprint_id,
                {"field": field, "rule_id": rule.id, "version": rule.version,
-                "window_start": window_start})
+                "window_start": window_start.isoformat()})
     log.warning("field %s quarantined on %s v%d (window %s)",
                 field, rule.fingerprint_id, rule.version, window_start)
     return True
@@ -90,7 +94,7 @@ def deactivate_rule(conn: psycopg.Connection, rule: ActiveDriftRule,
             return False
         _audit(cur, "rule_deactivated", rule.fingerprint_id,
                {"rule_id": rule.id, "version": rule.version,
-                "window_start": window_start})
+                "window_start": window_start.isoformat()})
     log.warning("rule %d (%s v%d) DEACTIVATED by drift (window %s)",
                 rule.id, rule.fingerprint_id, rule.version, window_start)
     return True
