@@ -1,5 +1,9 @@
-# M1+M2 CI. Unit tests only — no container services; the live E2E gate
+# M1+M2+M3 CI. Unit tests only — no container services; the live E2E gate
 # is `python scripts/smoke.py`, run locally against the compose stack.
+# Service deps install per-service (drift joined in M3; its psycopg pin is
+# identical to gateway's — the line exists so a future drift dep change
+# reaches CI with the suite that imports it). pyarrow==18.1.0 rides
+# services/gateway/requirements.txt into CI (py3.12 manylinux wheel).
 name: ci
 
 on: [push, pull_request]
@@ -19,6 +23,7 @@ jobs:
                       -r services/pipeline/requirements.txt \
                       -r services/gateway/requirements.txt \
                       -r services/onboarding/requirements.txt \
+                      -r services/drift/requirements.txt \
                       -r simulator/requirements.txt
           pip install pytest~=8.4 ruff==0.16.8
       - name: Lint
