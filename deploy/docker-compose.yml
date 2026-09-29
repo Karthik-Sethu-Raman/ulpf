@@ -48,6 +48,11 @@ services:
     environment:
       KAFKA_BOOTSTRAP: redpanda:9092
       DATABASE_URL: postgresql://pipeline_role:pipeline_dev@postgres:5432/ulpf
+      # Sample-capture headroom (M3 Task 12): the accumulating multi-run DB
+      # saturates the 200/fingerprint cap — after which a drift-deactivated
+      # fingerprint cannot accumulate onboarding samples and its re-entry is
+      # unobservable. Default stays 200; the smoke exports a larger value.
+      ULPF_SAMPLE_CAPTURE_CAP: ${ULPF_SAMPLE_CAPTURE_CAP:-200}
     restart: unless-stopped
     depends_on: { migrate: { condition: service_completed_successfully }, topics: { condition: service_completed_successfully }, seed: { condition: service_completed_successfully } }
   gateway:

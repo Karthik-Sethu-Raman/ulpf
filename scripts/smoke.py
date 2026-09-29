@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""ULPF acceptance smoke (M1 Task 12 + M2 Task 12, spec section 15) — the
-milestone exit gate.
+"""ULPF acceptance smoke (M1 Task 12 + M2 Task 12 + M3 Task 12, spec §15) —
+the milestone exit gate.
 
 End-to-end against the live compose stack: drives the simulator over the golden
 corpora, then verifies lossless ingest, the parsed/unparsed split, raw
@@ -14,7 +14,54 @@ fallback otherwise — expected on the default qwen3:4b tier, see
 docs/m2-slm-sanity.md), G does the same deterministically for the zenwall
 corpus via /api/rules/manual, and H re-runs the replay dance with active
 rules, proving raw/normalized/stats/sample-count idempotency including the
-onboarding sample dedup.
+onboarding sample dedup. The M3 asserts (I-L) run FIRST, before the A-H block,
+and drive the drift engine end to end on the live seeded syslog rule: I proves
+tier-1 fires (a fresh drift window with severity >= minor and a nonzero
+violation_rate), J that moderate drift quarantines src_endpoint.ip while the
+SRC value survives under ocsf.unmapped.SRC (values preserved, mapping
+disabled), K that severe drift deactivates the rule (fingerprint re-enters
+onboarding — sample_count grows) and a human restores it via reactivate, and
+L that a human un-quarantine re-enables the mapping for new parses.
+
+M3 demo env (exported below BEFORE compose up, per the Task 12 brief): the
+drift service gets ULPF_DRIFT_WINDOW_COUNT=30 plus a time horizon no demo
+gap can cross, so windows close on COUNT ONLY — deterministic 30-row
+boundaries (the brief's 15 s time-close is unsound on the accumulating DB:
+it slices the days-spread M1/M2 history into one-row windows and arms a
+degenerate all-zero baseline before the demo even starts; see the constant
+block below). The pipeline additionally gets ULPF_SAMPLE_CAPTURE_CAP=2000:
+the accumulating multi-run DB saturates the 200/fingerprint sample cap,
+after which a drift-deactivated fingerprint cannot accumulate onboarding
+samples and K's re-entry signal (sample_count grows) is unobservable
+(observed live in the Task 12 gate).
+
+M3 drift-run tuning (verified live, Task 12): the simulator's firmware-drift
+corruption is fully deterministic (selector = (index * 2654435761 % 1000) /
+1000 vs an escalating phase), so the smoke REPLICATES that math host-side
+(tune_drift_run) and plans the drift simulator run(s) such that the J-window
+— the 30-row drift window the quarantine decision rides on — carries a
+tier-1 violation_rate in [0.27, 0.43]: moderate (>= 0.20 -> field quarantine,
+Assert J) with margin on both sides (severe 0.50 would deactivate first and
+skip the quarantine entirely). The quarantine lands at the FIRST scan that
+sees that window; when that scan is also the baseline-establishing one the
+decision is tier-1-only by construction (the profile arms only after the
+scan's windows are recorded), which is what keeps the tier-2 null ladder from
+ever preempting J. After the quarantine, every further syslog parse is null
+at src_endpoint.ip (mapping disabled), so the next full window hits null_rate
+1.0 against the fresh baseline — ratio >= 40x, severe -> rule_deactivated
+(Assert K). With a view offset > 0 the plan uses a short PRE-RUN to complete
+the establishing window before the main run supplies the J-window's rows.
+
+M3 state restoration (not asserts): severe windows are permanent rows of the
+version's current view, and the drift loop re-evaluates the whole view every
+scan — so after K's deactivation the reactivated rule would be re-deactivated
+by the next scan. The smoke therefore (a) stops the drift container between
+K's restore and the end of the M3 block, and (b) finishes with a human
+version-bump dance (manual candidate without the SRC mapping -> approve -> the
+M2 backlog sweep supersedes every poisoned v1 row at the new version ->
+deactivate the new version -> reactivate v1, whose current view is now empty)
+before restarting drift. This restores Assert B's seeded-fp precondition for
+re-runs on the same accumulating DB (12/12 twice consecutive).
 
 Host requirements (Python 3.13 tested): psycopg[binary] plus the two libs
 importable (pip install -e libs/ulpf-core -e libs/ocsf-schema — the smoke
@@ -30,6 +77,9 @@ runs mint the next version and assert deltas).
 Usage:  python scripts/smoke.py          (from the repo root)
         ULPF_SMOKE_SLM_WAIT_S=300        (seconds to wait for an SLM candidate
                                           before the hand-authored fallback)
+        ULPF_SMOKE_M3_ONLY=1             (DEV: run only the M3 I-L block, skip
+                                          the A-H block — the exit gate always
+                                          runs the full 12)
 Exit:   0 all checks PASS, 1 any FAIL.
 """
 
@@ -37,6 +87,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -45,6 +96,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
 
 import psycopg
@@ -89,6 +141,7 @@ SLM_WAIT_TIMEOUT_S = int(os.environ.get("ULPF_SMOKE_SLM_WAIT_S", "300"))
 SAMPLES_WAIT_TIMEOUT_S = 60  # onboarding sample capture for a posted corpus
 REPARSE_TIMEOUT_S = 120  # approve -> reparse_complete audit row (R-T12-pre-d)
 AUDIT_PAGE = 200  # /api/audit page size (>= any fingerprint's M2-run trail)
+M3_ONLY = os.environ.get("ULPF_SMOKE_M3_ONLY", "") == "1"  # dev affordance
 
 COLLECTOR = "http://localhost:8080"
 NEWAPP_SOURCE = "newapp01"
@@ -118,6 +171,71 @@ ZENWALL_RULE = (
     r"^.*?(?P<extension>.*)$",
     (("rule", "message"),),
 )
+
+# --- M3 (Task 12 asserts I-L): the firmware-drift demo on the seeded syslog rule --
+
+SYSLOG_FP = "syslog"
+QUARANTINE_FIELD = "src_endpoint.ip"  # the syslog rule's SRC mapping (seed 001)
+
+# Demo drift knobs exported before compose up (Task 12 brief Step 1): windows
+# close every 30 rows so the demo fits in minutes. The brief pinned
+# WINDOW_TIME_S=15 as well, but on the ACCUMULATING DB that is unsound: the
+# M1/M2-era rows are spread across days, and a 15 s time-close slices them
+# into ~255 one-row windows at the very first scan — arming the syslog
+# baseline from ten degenerate 1-row windows (null_rate 0.0), after which the
+# tier-2 null ladder fires severe at ANY 5% null rate and deactivates the
+# rule before the moderate quarantine (Assert J) can ever land (observed
+# live). The smoke therefore pins a time horizon no demo gap can cross and
+# lets windows close on COUNT only — deterministic 30-row boundaries the
+# tuning math below models exactly.
+DRIFT_WINDOW_COUNT = "30"
+DRIFT_WINDOW_TIME_S = "1000000000"  # ~31.7 years: count-close only
+
+# The drift-run tuning targets the FIRST FULLY-NEW 30-row window of the run
+# (run rows offset+1 .. offset+30, where offset = current v1 view % 30) at a
+# tier-1 violation_rate in [MIN, MAX] — comfortably moderate (> 0.20), safely
+# below severe (0.50), with margin for +/-2 lines of send-time jitter.
+J_WINDOW_MIN_VIOLATION = 0.27
+J_WINDOW_MAX_VIOLATION = 0.43
+J_WINDOW_TARGET_VIOLATION = 0.35
+W_OLD_MAX_VIOLATION = 0.18  # the partial-completing window must stay minor
+
+DRIFT_I_TIMEOUT_S = 120.0   # I: metrics row appears (tier-1 fires)
+DRIFT_J_TIMEOUT_S = 120.0   # J: quarantine lands + a post-quarantine parsed event
+DRIFT_K_TIMEOUT_S = 120.0   # K: deactivate + sample growth
+DRIFT_L_TIMEOUT_S = 90.0    # L: un-quarantine + a clean mapped event
+RULE_REFRESH_MARGIN_S = 6.0 # pipeline reloads active rules every batch (<= 2 s)
+
+# K-maker: post-quarantine syslog parses are ALL null at src_endpoint.ip (the
+# mapping is disabled), so any full 30-row window of them hits null_rate 1.0
+# vs the ~0.017 baseline — ratio >= 40x, severe -> deactivate. Corruption
+# content is irrelevant here (clean lines are nulls too once quarantined); the
+# firmware-drift mode is used anyway to keep the demo narrative honest.
+K_MAKER = {"eps": "25", "drift_after": "1", "duration": "15"}
+# Probe/flush: brief steady runs (clean lines only). The probe supplies the
+# post-quarantine parsed events J inspects; the flush proves L's mapping came
+# back once clean lines flow after the human un-quarantine.
+PROBE_RUN = {"eps": "4", "duration": "6"}
+FLUSH_RUN = {"eps": "25", "duration": "8"}
+
+# Restoration dance rule (NOT an assert input): the seed syslog pattern with
+# every mapping EXCEPT SRC — sane on any corpus line (corruption only touches
+# SRC), so the candidate gate passes even against corrupted onboarding
+# samples, and the M2 backlog sweep re-parses the poisoned v1 rows under a
+# version that does not even map src_endpoint.ip (no violations recorded).
+SYSLOG_NO_SRC_RULE = (
+    r"^.*?IPTABLES-\w+:\s*(?P<extension>.*)$",
+    (("SPT", "src_endpoint.port"), ("DST", "dst_endpoint.ip"),
+     ("DPT", "dst_endpoint.port")),
+)
+SYSLOG_CORPUS = ROOT / "simulator" / "data" / "raw_logs_syslog.txt"
+
+# The simulator's deterministic corruption profile, replicated host-side for
+# tuning (T11 constants; see simulator/simulate.py corrupt_syslog). The
+# selector is a permutation of [0, 1) over any 1000 consecutive indices, so
+# `selector < phase` corrupts exactly a `phase` fraction in expectation.
+DRIFT_HASH_MULT = 2654435761
+DRIFT_HASH_MOD = 1000
 
 _SIM_LINE = re.compile(r"^(\w+) sent=(\d+)$", re.MULTILINE)
 _LAG_LINE = re.compile(r"^TOTAL-LAG\s+(\S+)\s*$", re.MULTILINE)
@@ -282,13 +400,32 @@ def step1_up() -> None:
         sys.exit("FATAL: stack not ready (gateway/web/rules API/kafka group 'pipeline').")
 
 
-def run_simulator() -> dict[str, int]:
-    print(f"== Step 2: simulator --eps {SIM_EPS} --duration {SIM_DURATION} ==")
+def run_simulator(*, mode: str = "steady", eps: str | None = None,
+                  duration: str | None = None, drift_after: str | None = None,
+                  loop: bool = False, label: str = "Step 2") -> dict[str, int]:
+    """`docker compose run` the simulator; defaults reproduce the M2 steady
+    call byte-for-byte. M3 passes mode/eps/duration/drift_after/loop for the
+    firmware-drift runs and the brief steady probes. Returns the parsed
+    stdout contract dict ({corpus: sent, total: N})."""
+    eps = SIM_EPS if eps is None else eps
+    duration = SIM_DURATION if duration is None else duration
+    args = ["--mode", mode, "--eps", eps, "--duration", duration]
+    if drift_after is not None:
+        args += ["--drift-after", drift_after]
+    if loop:
+        args.append("--loop")  # M3 only: repeat corpora so one run yields 30+ syslog rows
+    print(f"== {label}: simulator --mode {mode} --eps {eps} --duration {duration}"
+          + (f" --drift-after {drift_after}" if drift_after is not None else "")
+          + (" --loop" if loop else "") + " ==")
     # --profile sim BEFORE run: the simulator service is profile-gated
     # (docker-compose.yml), and `docker compose run` refuses a gated service
-    # whose profile is not active (R-T12-pre-b).
-    out = compose("--profile", "sim", "run", "--rm", "-T", "simulator",
-                  "--eps", SIM_EPS, "--duration", SIM_DURATION, timeout=SIM_TIMEOUT_S)
+    # whose profile is not active (R-T12-pre-b). --build: profile-gated
+    # services are NOT built by `up --build` (their profile is inactive
+    # there), so without this the run would use whatever image happened to
+    # be built last — observed live in M3 Task 12 as an M2-era image without
+    # firmware-drift mode. Cached layers make the rebuild cheap.
+    out = compose("--profile", "sim", "run", "--rm", "-T", "--build", "simulator",
+                  *args, timeout=SIM_TIMEOUT_S)
     sent = {name: int(n) for name, n in _SIM_LINE.findall(out.stdout)}
     if out.returncode != 0 or "total" not in sent:
         print("stdout:", out.stdout[-2000:])
@@ -928,6 +1065,544 @@ def assert_h(fp: str, zfp: str) -> None:
           + ("" if not problems else "; PROBLEMS: " + "; ".join(problems)))
 
 
+# --- M3: drift demo asserts I-L (Task 12 Steps 2-5) -------------------------------
+
+_SEVERITY_RANK = {name: rank for rank, name in
+                  enumerate(("none", "minor", "moderate", "severe"))}
+
+
+def _parse_ts(value) -> datetime:
+    """API timestamp (ISO-8601 string or datetime) -> aware UTC datetime."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if not value:
+        return datetime.min.replace(tzinfo=UTC)
+    parsed = datetime.fromisoformat(str(value))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _selector(index: int) -> float:
+    """simulator.corrupt_syslog's deterministic per-line corruption selector
+    (host-side replica for run tuning — the seed IS the corpus line index)."""
+    return (index * DRIFT_HASH_MULT % DRIFT_HASH_MOD) / DRIFT_HASH_MOD
+
+
+def _row_outcome(k: int, rate: float, drift_after: str, duration: str,
+                 corpus_lines: int) -> tuple[bool, bool]:
+    """(violates, nulls) for the k-th syslog send (1-based) of ONE simulator
+    run at `rate` syslog lines/s — replica of simulator.corrupt_syslog: send
+    time t = k/rate (one syslog line per round-robin pass), phase ramping
+    from drift_after over the escalation span, corrupted iff
+    selector((k-1) % corpus_lines) < phase, and among the corrupted 1 in 3
+    (by corpus index) renames SRC->SRCADDR (a null) while the rest write the
+    invalid SRC value (a tier-1 violation)."""
+    t = k / rate
+    a = float(drift_after)
+    if t <= a:
+        return False, False
+    span = max(float(duration) - a, 1.0)
+    phase = min(max((t - a) / span, 0.0), 1.0)
+    index = (k - 1) % corpus_lines
+    if _selector(index) < phase:
+        return index % 3 != 0, index % 3 == 0
+    return False, False
+
+
+def _window_counts(segments, corpus_lines: int) -> tuple[int, int]:
+    """(violations, nulls) over one 30-row window assembled from consecutive
+    pieces of one or two simulator runs. Each segment is (first_k, n_rows,
+    eps, drift_after, duration): sends first_k..first_k+n_rows-1 of a run
+    with those parameters (send numbering restarts per run — each
+    `compose run` is a fresh process with fresh cursors)."""
+    viol = nulls = 0
+    for first_k, n, eps, drift_after, duration in segments:
+        rate = float(eps) / 4.0
+        for k in range(first_k, first_k + n):
+            v, nu = _row_outcome(k, rate, drift_after, duration, corpus_lines)
+            viol += int(v)
+            nulls += int(nu)
+    return viol, nulls
+
+
+def tune_drift_run(offset: int, corpus_lines: int) -> dict:
+    """Plan the firmware-drift simulator run(s) for THIS run's view offset.
+
+    The drift service closes a window every 30 current-view rows of the
+    ACTIVE version. offset = view%30 decides the shape: with offset == 0 the
+    run's first 30 rows are themselves the next closed window — which is also
+    the ESTABLISHING 10th window (the DB history has exactly 9 windows, a
+    verified M3 starting condition; once a baseline exists this window is
+    simply the next one and the same math holds, see below). With offset > 0
+    the run's first E = 30-offset rows complete the older partial (the
+    establishing window), and the J-window is the NEXT one.
+
+    The quarantine (J) must land on a window whose window_start is INSIDE
+    this run (I's delta filter and J's poll both key off fresh rows): with
+    offset == 0 the run's first 30 rows are that window. With offset > 0 the
+    run's first E = 30-offset rows complete the OLDER partial — that window
+    STARTS on a prior-run row, so it must stay MINOR (the quarantine must not
+    land there: its metrics row is invisible to I's window_start filter and
+    its scan races the null-severe deactivate) — and the NEXT window, built
+    from the main run's fresh rows, is the J-window. The plan guarantees:
+
+    - the J-window's deterministic violation_rate lands in
+      [J_WINDOW_MIN, J_WINDOW_MAX] — moderate with margin on both sides,
+      robust to +/-2 lines of send-time jitter;
+    - the establishing window (offset > 0) stays minor (< W_OLD_MAX
+      violations), so the moderate decision — and I's fresh metrics row —
+      both arrive at the J-window's scan, before any severe window.
+
+    Returns {"runs": [params...] to execute in order, "j_violation": float,
+    "j_nulls": int, "establishing_violation": float}; params dicts are
+    run_simulator kwargs (mode/loop added by the caller).
+    """
+    def rate_of(eps):
+        return float(eps) / 4.0
+
+    space = []
+    if offset == 0:
+        # One run: its rows 1..30 are the J-window (and the establishing one).
+        for eps in ("6", "8", "10"):
+            rate = rate_of(eps)
+            for drift_after in ("0", "1", "2"):
+                duration = 30 / rate + 1.0
+                while duration <= 30 / rate + 10.0:
+                    d = f"{duration:.1f}"
+                    viol, nulls = _window_counts(
+                        [(1, 30, eps, drift_after, d)], corpus_lines)
+                    space.append({"runs": [{"eps": eps, "drift_after": drift_after,
+                                            "duration": d}],
+                                  "j_violation": viol / 30, "j_nulls": nulls,
+                                  "est_violation": viol / 30, "est_nulls": nulls,
+                                  "segments": [(1, 30, eps, drift_after, d)]})
+                    duration += 0.5
+    else:
+        est_rows = 30 - offset
+        # Two runs: a short PRE-RUN completes the establishing window (kept
+        # minor); the MAIN run (fresh cursors) supplies the J-window's bulk.
+        # The pre-run may overflow by 0-2 rows into the J-window's head.
+        for pre_eps in ("4", "6", "8", "10"):
+            pre_rate = rate_of(pre_eps)
+            for pre_a in ("0", "1", "2", "3"):
+                pre_d = est_rows / pre_rate + 0.1
+                while pre_d <= est_rows / pre_rate + 0.9:
+                    pd = f"{pre_d:.1f}"
+                    pre_rows = min(max(math.ceil(pre_rate * float(pd)), est_rows),
+                                   est_rows + 2)
+                    est_viol, est_nulls = _window_counts(
+                        [(1, est_rows, pre_eps, pre_a, pd)], corpus_lines)
+                    overflow = pre_rows - est_rows
+                    if est_viol >= W_OLD_MAX_VIOLATION * 30:
+                        pre_d += 0.2
+                        continue
+                    for eps in ("6", "8", "10"):
+                        rate = rate_of(eps)
+                        for drift_after in ("0", "1", "2"):
+                            main_rows = 30 - overflow
+                            duration = main_rows / rate + 1.0
+                            while duration <= main_rows / rate + 8.0:
+                                d = f"{duration:.1f}"
+                                segments = []
+                                if overflow:
+                                    segments.append((est_rows + 1, overflow,
+                                                     pre_eps, pre_a, pd))
+                                segments.append((1, main_rows, eps, drift_after, d))
+                                viol, nulls = _window_counts(segments, corpus_lines)
+                                space.append({
+                                    "runs": [{"eps": pre_eps, "drift_after": pre_a,
+                                              "duration": pd},
+                                             {"eps": eps, "drift_after": drift_after,
+                                              "duration": d}],
+                                    "j_violation": viol / 30, "j_nulls": nulls,
+                                    "est_violation": est_viol / 30,
+                                    "est_nulls": est_nulls, "segments": segments})
+                                duration += 0.5
+                    pre_d += 0.2
+    tiers = [
+        lambda c: J_WINDOW_MIN_VIOLATION <= c["j_violation"] <= J_WINDOW_MAX_VIOLATION,
+        lambda c: 0.22 <= c["j_violation"] <= 0.48,
+        lambda c: 0.20 <= c["j_violation"] < 0.50,
+    ]
+    if not space:
+        # No pre-run kept the establishing window minor — fall back to any
+        # pre-run params (the quarantine may land on the old-started window;
+        # I/J then depend on the main run's own windows). Loud, never silent.
+        print("  WARNING: no pre-run kept the establishing window minor; "
+              "falling back to untuned pre-run")
+        pre_eps, pre_a = "6", "2"
+        pd = f"{est_rows / rate_of(pre_eps) + 0.5:.1f}"
+        for eps in ("6", "8", "10"):
+            rate = rate_of(eps)
+            for drift_after in ("0", "1", "2"):
+                d = f"{30 / rate + 5.0:.1f}"
+                viol, nulls = _window_counts(
+                    [(1, 30, eps, drift_after, d)], corpus_lines)
+                space.append({"runs": [{"eps": pre_eps, "drift_after": pre_a,
+                                        "duration": pd},
+                                       {"eps": eps, "drift_after": drift_after,
+                                        "duration": d}],
+                              "j_violation": viol / 30, "j_nulls": nulls,
+                              "est_violation": 1.0, "est_nulls": 0,
+                              "segments": [(1, 30, eps, drift_after, d)]})
+    chosen = None
+    for tier_no, tier in enumerate(tiers):
+        pool = [c for c in space if tier(c)]
+        if pool:
+            chosen = min(pool, key=lambda c: abs(c["j_violation"] - J_WINDOW_TARGET_VIOLATION))
+            if tier_no > 0:
+                print(f"  WARNING: drift-run tuning relaxed to tier {tier_no + 1} "
+                      f"(J-window violation={chosen['j_violation']:.3f})")
+            break
+    if chosen is None:
+        chosen = min(space, key=lambda c: abs(c["j_violation"] - J_WINDOW_TARGET_VIOLATION))
+        print(f"  WARNING: drift-run tuning fell back to closest "
+              f"violation_rate={chosen['j_violation']:.3f} (no candidate met the bands)")
+    return chosen
+
+
+def active_rule(fp: str) -> dict | None:
+    status, body = http_json(f"{GATEWAY}/api/rules?status=active")
+    if status != 200 or not isinstance(body, dict):
+        return None
+    for rule in body.get("rules", []):
+        if rule.get("fingerprint_id") == fp:
+            return rule
+    return None
+
+
+def syslog_view_count(version) -> int:
+    """Rows of the ACTIVE version's current view — the drift service's window
+    input; offset = count % 30 decides where this run's rows slice."""
+    with psycopg.connect(DSN) as conn, conn.cursor() as cur:
+        return q1(cur, "SELECT count(*) FROM normalized_events "
+                       "WHERE fingerprint_id=%s AND rule_version=%s "
+                       "AND superseded_by_event_id IS NULL", (SYSLOG_FP, version))
+
+
+def audit_after(fp: str, action: str, *, actor: str | None = None,
+                after: datetime | None = None, want: dict | None = None) -> dict | None:
+    """Newest matching audit row, or None. `after` bounds ts strictly (delta
+    base: prior-run rows excluded); `want` matches detail key-values."""
+    status, body = http_json(f"{GATEWAY}/api/audit?fingerprint={fp}&limit={AUDIT_PAGE}")
+    if status != 200 or not isinstance(body, dict):
+        return None
+    for row in body.get("audit", []):
+        detail = row.get("detail") or {}
+        if row.get("action") != action:
+            continue
+        if actor is not None and row.get("actor") != actor:
+            continue
+        if want and not all(detail.get(k) == v for k, v in want.items()):
+            continue
+        if after is not None and _parse_ts(row.get("ts")) <= after:
+            continue
+        return row
+    return None
+
+
+def wait_parsed_event(after_ts: datetime, predicate, timeout_s: float) -> dict | None:
+    """Poll the newest 50 parsed syslog events until one satisfies
+    predicate(event, after_ts); None on timeout."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        status, body = http_json(
+            f"{GATEWAY}/api/events?fingerprint={SYSLOG_FP}&status=parsed&limit=50")
+        if status == 200 and isinstance(body, dict):
+            for ev in body.get("events") or []:
+                try:
+                    if predicate(ev, after_ts):
+                        return ev
+                except (KeyError, TypeError, ValueError):
+                    continue
+        time.sleep(POLL_INTERVAL_S)
+    return None
+
+
+def _j_event_ok(ev: dict, after_ts: datetime) -> bool:
+    """J's post-quarantine parse: the SRC value preserved under
+    ocsf.unmapped.SRC, src_endpoint.ip absent (mapping disabled)."""
+    ocsf = ev.get("ocsf") or {}
+    unmapped = ocsf.get("unmapped") or {}
+    src = ocsf.get("src_endpoint") or {}
+    return (_parse_ts(ev.get("parsed_at")) > after_ts
+            and unmapped.get("SRC") is not None
+            and "ip" not in src)
+
+
+def _l_event_ok(ev: dict, after_ts: datetime) -> bool:
+    """L's post-un-quarantine parse: src_endpoint.ip mapped again, SRC no
+    longer dangling in unmapped."""
+    ocsf = ev.get("ocsf") or {}
+    unmapped = ocsf.get("unmapped") or {}
+    src = ocsf.get("src_endpoint") or {}
+    return (_parse_ts(ev.get("parsed_at")) > after_ts
+            and isinstance(src.get("ip"), str) and src["ip"] != ""
+            and "SRC" not in unmapped)
+
+
+def assert_i_tier1(run_start: datetime, plan: dict) -> None:
+    print("== Assert I: tier-1 fires (fresh syslog drift window with violations) ==")
+    sent_total = 0
+    for i, run in enumerate(plan["runs"], 1):
+        sent = run_simulator(mode="firmware-drift", eps=run["eps"],
+                             duration=run["duration"], drift_after=run["drift_after"],
+                             loop=True, label=f"I drift run {i}/{len(plan['runs'])}")
+        sent_total += sent.get("syslog", 0)
+    deadline = time.monotonic() + DRIFT_I_TIMEOUT_S
+    hit, last = None, "no metrics response yet"
+    while time.monotonic() < deadline and hit is None:
+        status, body = http_json(f"{GATEWAY}/api/drift/metrics")
+        if status == 200 and isinstance(body, dict):
+            rows = body.get("metrics") or []
+            last = f"{len(rows)} metric row(s), latest syslog window " \
+                   f"{next((r['window_start'] for r in rows if r['fingerprint_id'] == SYSLOG_FP), 'none')}"
+            for row in rows:
+                if (row.get("fingerprint_id") == SYSLOG_FP
+                        and _SEVERITY_RANK.get(row.get("severity"), -1) >= _SEVERITY_RANK["minor"]
+                        and (row.get("violation_rate") or 0) > 0
+                        and _parse_ts(row.get("window_start")) > run_start):
+                    hit = row
+                    break
+        if hit is None:
+            time.sleep(POLL_INTERVAL_S)
+    if hit is None:
+        check("I tier-1 fires", False,
+              f"no syslog metrics row with severity>=minor and violation_rate>0 "
+              f"within {DRIFT_I_TIMEOUT_S:.0f}s (last poll: {last})")
+        return
+    runs_desc = "; ".join(f"eps={r['eps']} drift-after={r['drift_after']} "
+                          f"duration={r['duration']}s" for r in plan["runs"])
+    check("I tier-1 fires", True,
+          f"syslog field {hit['field']!r} window {hit['window_start']}: "
+          f"severity={hit['severity']} violation_rate={hit['violation_rate']:.3f} "
+          f"null_rate={(hit['null_rate'] or 0):.3f} events_count={hit['events_count']} "
+          f"(tuned drift run(s): {runs_desc}; {sent_total} syslog lines sent; "
+          f"predicted J-window violation {plan['j_violation']:.3f})")
+
+
+def _wait_rule_quarantined(timeout_s: float) -> dict | None:
+    """Poll GET /api/rules/syslog until the ACTIVE version's quarantined_fields
+    contains the SRC mapping's target."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        status, body = http_json(f"{GATEWAY}/api/rules/{SYSLOG_FP}")
+        if status == 200 and isinstance(body, dict):
+            for rule in body.get("rules") or []:
+                if rule.get("status") == "active":
+                    if QUARANTINE_FIELD in (rule.get("quarantined_fields") or []):
+                        return rule
+                    break  # active version exists, field not quarantined yet
+        time.sleep(POLL_INTERVAL_S)
+    return None
+
+
+def assert_j_quarantine(run_start: datetime) -> None:
+    print("== Assert J: moderate drift quarantines src_endpoint.ip, value preserved ==")
+    quarantined = _wait_rule_quarantined(DRIFT_J_TIMEOUT_S)
+    if quarantined is None:
+        check("J quarantine + values preserved", False,
+              f"active syslog rule never listed {QUARANTINE_FIELD} in "
+              f"quarantined_fields within {DRIFT_J_TIMEOUT_S:.0f}s")
+        return
+    audit = audit_after(SYSLOG_FP, "field_quarantined", actor="drift", after=run_start)
+    if audit is None:
+        check("J quarantine + values preserved", False,
+              f"quarantined_fields lists {QUARANTINE_FIELD} but no fresh "
+              f"field_quarantined audit row with actor=drift")
+        return
+    quarantine_ts = _parse_ts(audit.get("ts"))
+    # The pipeline honors quarantine on the next rule refresh (<= 2 s); the
+    # margin plus a short steady probe supplies post-quarantine parses.
+    time.sleep(RULE_REFRESH_MARGIN_S)
+    run_simulator(label="J probe run (steady)", **PROBE_RUN)
+    event = wait_parsed_event(quarantine_ts, _j_event_ok, DRIFT_J_TIMEOUT_S)
+    if event is None:
+        check("J quarantine + values preserved", False,
+              f"no parsed syslog event after the quarantine audit ({audit.get('ts')}) "
+              f"carries unmapped.SRC with src_endpoint.ip absent")
+        return
+    ocsf = event["ocsf"]
+    check("J quarantine + values preserved", True,
+          f"quarantined_fields=['{QUARANTINE_FIELD}'] on v{quarantined['version']} "
+          f"(audit field_quarantined actor=drift at {audit.get('ts')}); parsed event "
+          f"{event['event_id']} @ {event['parsed_at']} preserves SRC value "
+          f"{ocsf['unmapped']['SRC']!r} under ocsf.unmapped.SRC with src_endpoint.ip absent")
+
+
+def assert_k_severe(run_start: datetime, active: dict, pre_samples: int) -> None:
+    print("== Assert K: severe -> rule deactivated -> re-onboard -> human restore ==")
+    problems: list[str] = []
+    parts: list[str] = []
+    run_simulator(mode="firmware-drift", label="K-maker run (post-quarantine null flood)",
+                  loop=True, **K_MAKER)
+
+    deadline = time.monotonic() + DRIFT_K_TIMEOUT_S
+    absent = False
+    while time.monotonic() < deadline:
+        # Only a SUCCESSFUL listing may prove absence (active_rule_fingerprints
+        # degrades to an empty set on fetch errors — a hiccup must not
+        # false-pass this check).
+        status, body = http_json(f"{GATEWAY}/api/rules?status=active")
+        if status == 200 and isinstance(body, dict):
+            fps = {r.get("fingerprint_id") for r in body.get("rules") or []}
+            if SYSLOG_FP not in fps:
+                absent = True
+                break
+        time.sleep(POLL_INTERVAL_S)
+    if absent:
+        parts.append("syslog absent from /api/rules?status=active")
+    else:
+        problems.append("syslog never left the active rules within "
+                        f"{DRIFT_K_TIMEOUT_S:.0f}s")
+
+    audit = audit_after(SYSLOG_FP, "rule_deactivated", actor="drift", after=run_start,
+                        want={"rule_id": active["id"]})
+    if audit:
+        parts.append(f"audit rule_deactivated actor=drift rule_id={active['id']} "
+                     f"({(audit.get('detail') or {}).get('window_start')})")
+    else:
+        problems.append("no fresh rule_deactivated audit row actor=drift "
+                        f"rule_id={active['id']}")
+
+    # Seed a few syslog lines NOW that the rule is provably down: the
+    # K-maker's own tail is a race (the simulator exits seconds before the
+    # deactivating scan, so its last rows may all parse while the rule is
+    # still active), but any line arriving after the deactivation is
+    # unparsed and captured as an onboarding sample — the re-entry signal.
+    run_simulator(label="K sample seeder (steady, rule down)",
+                  eps="8", duration="4")
+
+    samples = pre_samples
+    deadline = time.monotonic() + DRIFT_K_TIMEOUT_S
+    while time.monotonic() < deadline:
+        samples = sample_count(SYSLOG_FP)
+        if samples > pre_samples:
+            break
+        time.sleep(POLL_INTERVAL_S)
+    if samples > pre_samples:
+        parts.append(f"onboarding re-entry: sample_count {pre_samples}->{samples}")
+    else:
+        problems.append(f"sample_count never grew from {pre_samples}")
+
+    # Freeze enforcement before the human restore: severe windows are
+    # permanent rows of the version's view and the loop re-evaluates the whole
+    # view every scan, so a live drift service would re-deactivate the
+    # restored rule within one poll (verified live). Drift restarts after the
+    # M3 block finishes restoring state.
+    compose("stop", "drift", timeout=120)
+    status, body = http_post_json(f"{GATEWAY}/api/rules/{active['id']}/reactivate",
+                                  {"actor": "smoke", "reason": "M3 smoke: human restore"})
+    if status == 200 and isinstance(body, dict) and body.get("status") == "active":
+        parts.append(f"reactivate rule_id={active['id']} -> active (drift paused)")
+    else:
+        problems.append(f"reactivate rule_id={active['id']} -> {status}: {body!r}")
+    restored = active_rule(SYSLOG_FP)
+    if restored is not None and restored.get("id") == active["id"]:
+        parts.append(f"active again: id={restored['id']} v{restored['version']}")
+    else:
+        problems.append(f"active syslog rule after restore: {restored!r}")
+    reactivated = audit_after(SYSLOG_FP, "rule_reactivated", after=run_start,
+                              want={"rule_id": active["id"]})
+    if reactivated:
+        parts.append(f"audit rule_reactivated rule_id={active['id']}")
+    else:
+        problems.append("no fresh rule_reactivated audit row "
+                        f"rule_id={active['id']}")
+    check("K severe -> deactivate -> re-onboard -> human restore", not problems,
+          "; ".join(parts) + ("" if not problems else
+                              "; PROBLEMS: " + "; ".join(problems)))
+
+
+def assert_l_unquarantine(run_start: datetime) -> None:
+    print("== Assert L: human un-quarantine re-enables the mapping ==")
+    status, body = http_post_json(f"{GATEWAY}/api/rules/{SYSLOG_FP}/unquarantine",
+                                  {"field": QUARANTINE_FIELD, "actor": "smoke"})
+    if status != 200 or not isinstance(body, dict):
+        check("L human un-quarantine", False,
+              f"POST unquarantine -> {status}: {body!r}")
+        return
+    fields = body.get("quarantined_fields")
+    audit = audit_after(SYSLOG_FP, "field_unquarantined", after=run_start,
+                        want={"field": QUARANTINE_FIELD})
+    if fields != [] or audit is None:
+        check("L human un-quarantine", False,
+              f"quarantined_fields={fields!r} (want []), "
+              f"audit field_unquarantined={'present' if audit else 'MISSING'}")
+        return
+    unquarantine_ts = _parse_ts(audit.get("ts"))
+    # Clean lines flush the quarantined-parses out; once the pipeline has the
+    # un-quarantined rule (<= 2 s refresh), parses map src_endpoint.ip again.
+    run_simulator(label="L flush run (steady)", **FLUSH_RUN)
+    event = wait_parsed_event(unquarantine_ts, _l_event_ok, DRIFT_L_TIMEOUT_S)
+    if event is None:
+        check("L human un-quarantine", False,
+              f"no parsed syslog event after the un-quarantine ({audit.get('ts')}) "
+              f"maps src_endpoint.ip again")
+        return
+    src_ip = event["ocsf"]["src_endpoint"]["ip"]
+    check("L human un-quarantine", True,
+          f"POST unquarantine -> 200 quarantined_fields=[] (audit field_unquarantined "
+          f"actor=smoke at {audit.get('ts')}); next clean parse {event['event_id']} @ "
+          f"{event['parsed_at']} maps src_endpoint.ip={src_ip!r}")
+
+
+def restore_syslog_rule(v1: dict) -> None:
+    """Version-bump dance (restoration, not an assert): severe/null windows are
+    permanent rows of v1's current view, so v1 can never again survive a drift
+    scan. Mint a successor version WITHOUT the SRC mapping (its candidate gate
+    is corruption-proof: corruption only ever touches SRC), approve it — the M2
+    backlog sweep then re-parses and supersedes EVERY v1 row under the new
+    version, emptying v1's drift view — deactivate the successor, and
+    reactivate v1: active again, empty view, no severe findings possible. The
+    stats current view keeps every row parsed (B's precondition), and the next
+    smoke run's I-L block replays the whole cycle on v1."""
+    print("== M3 restore: version-bump dance (clears v1's poisoned drift view) ==")
+    failures: list[str] = []
+    lines = read_corpus_lines(SYSLOG_CORPUS)
+    report = validate_local_rule(SYSLOG_FP, SYSLOG_NO_SRC_RULE, lines)
+    if not report.passed:
+        failures.append(f"local gate: {report.checks}")
+    rule_id = version = None
+    if report.passed:
+        status, body = post_manual_candidate(SYSLOG_FP, SYSLOG_NO_SRC_RULE)
+        if status == 201 and isinstance(body, dict) and "rule_id" in body:
+            rule_id, version = body["rule_id"], body.get("version")
+        else:
+            failures.append(f"manual candidate -> {status}: {body!r}")
+    if rule_id is not None:
+        status, body = http_post_json(
+            f"{GATEWAY}/api/rules/{SYSLOG_FP}/candidates/{rule_id}/approve",
+            {"actor": "smoke", "reason": "M3 smoke restore"})
+        if status != 200:
+            failures.append(f"approve v{version} -> {status}: {body!r}")
+    if not failures and version is not None:
+        reparse = wait_reparse_complete(SYSLOG_FP, version, REPARSE_TIMEOUT_S)
+        if reparse is None:
+            failures.append(f"no reparse_complete v{version} within {REPARSE_TIMEOUT_S:.0f}s")
+        else:
+            print(f"  sweep v{version}: inserted={reparse.get('inserted')} "
+                  f"superseded={reparse.get('superseded')} (v1 drift view now empty)")
+    if not failures:
+        status, body = http_post_json(f"{GATEWAY}/api/rules/{SYSLOG_FP}/deactivate",
+                                      {"actor": "smoke", "reason": "M3 smoke restore"})
+        if status != 200:
+            failures.append(f"deactivate successor -> {status}: {body!r}")
+    if not failures:
+        status, body = http_post_json(f"{GATEWAY}/api/rules/{v1['id']}/reactivate",
+                                      {"actor": "smoke", "reason": "M3 smoke restore"})
+        if status != 200:
+            failures.append(f"reactivate v1 id={v1['id']} -> {status}: {body!r}")
+    started = compose("start", "drift", timeout=120)
+    if started.returncode != 0:
+        failures.append(f"compose start drift failed: {started.stderr.strip()[:120]}")
+    if failures:
+        sys.exit("FATAL: M3 restoration dance failed: " + "; ".join(failures))
+    left = syslog_view_count(v1["version"])
+    print(f"  restore complete: successor v{version} deactivated (holds the superseded "
+          f"backlog), seed rule id={v1['id']} active with a {left}-row drift view; "
+          f"drift service restarted")
+
+
 def wait_quiet(window_s: float = 4.0, timeout_s: float = 45.0) -> int:
     """Wait until raw_events stops moving, then return its count.
 
@@ -949,8 +1624,53 @@ def wait_quiet(window_s: float = 4.0, timeout_s: float = 45.0) -> int:
 
 
 def main() -> int:
-    print(f"ULPF smoke (M1 A-E + M2 F-H) - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    # M3 demo knobs (Task 12 Step 1) — exported BEFORE compose up so the drift
+    # container is created with demo-scale windows (30 rows; compose
+    # passthrough verified in Task 4). The window count is load-bearing for
+    # the drift-run tuning below.
+    os.environ["ULPF_DRIFT_WINDOW_COUNT"] = DRIFT_WINDOW_COUNT
+    os.environ["ULPF_DRIFT_WINDOW_TIME_S"] = DRIFT_WINDOW_TIME_S
+    # Sample-capture headroom (observed live in the Task 12 gate): the
+    # accumulating DB saturates the 200/fingerprint cap, after which a
+    # drift-deactivated fingerprint cannot accumulate onboarding samples and
+    # K's re-entry signal (sample_count grows) is unobservable. 2000 leaves
+    # headroom for many accumulating runs; the code default stays 200.
+    os.environ["ULPF_SAMPLE_CAPTURE_CAP"] = "2000"
+    print(f"ULPF smoke (M1 A-E + M2 F-H + M3 I-L) - {time.strftime('%Y-%m-%d %H:%M:%S')}")
     step1_up()
+
+    # M3 block FIRST (Task 12 Steps 2-5): the drift demo needs the syslog
+    # baseline to arm DURING the firmware-drift run (the establishing 10th
+    # window must itself be the moderate one — see the module header), so it
+    # runs before the A-H steady traffic can pre-arm a clean baseline.
+    run_start = datetime.now(UTC)
+    active = active_rule(SYSLOG_FP)
+    if active is None:
+        sys.exit("FATAL: no active syslog rule at the M3 block start")
+    corpus_lines = len(read_corpus_lines(SYSLOG_CORPUS))
+    offset = syslog_view_count(active["version"]) % 30
+    plan = tune_drift_run(offset, corpus_lines)
+    runs_desc = " then ".join(
+        f"eps={r['eps']}/after={r['drift_after']}/dur={r['duration']}s" for r in plan["runs"])
+    print(f"  syslog seed rule id={active['id']} v{active['version']}; drift view "
+          f"offset={offset} -> tuned drift run(s): {runs_desc} "
+          f"(predicted J-window violation {plan['j_violation']:.3f} "
+          f"({plan['j_nulls']} nulls), establishing window "
+          f"{plan['est_violation']:.3f})")
+    pre_samples = sample_count(SYSLOG_FP)
+
+    assert_i_tier1(run_start, plan)
+    assert_j_quarantine(run_start)
+    assert_k_severe(run_start, active, pre_samples)
+    assert_l_unquarantine(run_start)
+    restore_syslog_rule(active)
+
+    if M3_ONLY:
+        failed = [name for name, ok, _ in results if not ok]
+        print(f"\nSMOKE RESULT (M3 I-L only): {'PASS' if not failed else 'FAIL'} "
+              f"({len(results) - len(failed)}/{len(results)} checks)"
+              + (f" failed: {', '.join(failed)}" if failed else ""))
+        return 0 if not failed else 1
 
     print("== Snapshot before (delta base) ==")
     before_raw = wait_quiet()
@@ -959,7 +1679,7 @@ def main() -> int:
     print(f"  raw_events={before_raw} normalized_events={before_norm} "
           f"fingerprints={len(before_fps)}")
 
-    sent = run_simulator()
+    sent = run_simulator(label="Step 2 (steady)")
     print("  " + ", ".join(f"{name}={n}" for name, n in sorted(sent.items())))
 
     drained, raw_delta, norm_delta = wait_drain(before_raw, before_norm, sent["total"])
