@@ -435,6 +435,14 @@ def run_simulator(*, mode: str = "steady", eps: str | None = None,
     missing = {"acmegw", "cef", "json", "syslog"} - set(sent)
     if missing or corpora_total != sent["total"]:
         sys.exit(f"FATAL: simulator stdout contract broken: {sent} (missing={missing})")
+    # Deterministic delivery (live Task 12 finding): the collector's producer
+    # rides librdkafka defaults, and under this box's load its queue delayed
+    # messages by many minutes (and retry-duplicated corpora) — breaking K's
+    # sample poll and G/H's deltas on otherwise-green runs. A graceful
+    # collector restart runs the app's shutdown flush (uvicorn SIGTERM ->
+    # lifespan -> producer.flush), draining the queue in seconds. The
+    # collector is a stateless forwarder; the restart is benign.
+    compose("restart", "collector", timeout=120)
     return sent
 
 
