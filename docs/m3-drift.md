@@ -153,7 +153,13 @@ reactivate/deactivate endpoints. Restoration note (measured live in the Task
 windows is re-deactivated by the next scan — recovery from a real drift event
 is a **version bump** (approve a successor rule; the M2 backlog sweep
 supersedes the poisoned version's rows out of its drift view), which is the
-same path a human edit takes.
+same path a human edit takes. The moderate rung re-arms the same way:
+un-quarantining a field whose historical window still evaluates moderate is
+undone by the next scan — redundant-quarantine suppression holds only while
+the field is IN `quarantined_fields`, so removal re-arms it (findings are
+re-evaluated every scan, R-M3-2). An un-quarantine sticks durably only once
+the offending window is superseded (the same version bump) or the version's
+current view evaluates clean.
 
 ## R-M3-4/R-M3-5 — two detection tiers; the math is pure
 
@@ -173,7 +179,8 @@ a version bump re-arms naturally. Signals: null-rate ratio ladder (the legacy
 demo's proven 3x/10x/40x + 0.05-absolute gate), match-rate absolute-drop
 ladder (0.10/0.25/0.50), JS-divergence shape ladder (0.15/0.35/0.60,
 add-1-smoothed, count-scaled), per-fingerprint volume bounds (silence severe,
-outside minor). All of it lives in `libs/ulpf-core/ulpf_core/drift.py` —
+outside minor — the silence rung's reachability is qualified in R-M3-10). All
+of it lives in `libs/ulpf-core/ulpf_core/drift.py` —
 stdlib-only, zero deps, fully unit-tested (Task 3: 37 tests; the drift
 service suites add 102).
 
@@ -223,11 +230,22 @@ window_start}` (deactivate).
 ## R-M3-10 — per-SOURCE volume deferred to M4
 
 Per-fingerprint volume bounds ship now (`__rule__` sentinel rows carry
-events_count min/max from the baseline; silence is severe — a dead feed never
-looks healthy). Per-SOURCE volume needs a `raw_events` join
-(`normalized_events` carries no `source_id`); deferred to M4 as polish — the
-current-view granularity is what the spec's silence/flood signal needs at MVP
-scale.
+events_count min/max from the baseline; the ladder maps a zero-count window
+to severe — with a reachability caveat, directly below). Per-SOURCE volume
+needs a `raw_events` join (`normalized_events` carries no `source_id`);
+deferred to M4 as polish — the current-view granularity is what the spec's
+silence/flood signal needs at MVP scale.
+
+Silence honesty note: the severe-on-zero rung cannot fire end-to-end as
+shipped. `compute_windows` (`services/drift/windows.py`) closes only
+non-empty windows, so a dead feed produces no new rows — no new windows, no
+`__rule__` finding, nothing to evaluate; `volume_severity`'s
+`count == 0 → severe` branch (`libs/ulpf-core/ulpf_core/drift.py`) is
+defensive-only, and the drought rung fires only retroactively, once traffic
+resumes and a below-bounds window closes. A wall-clock last-window-age check
+is the M4 path — deliberately excluded here by R-M3-2's data-only determinism
+(windows derive from the rows' own `parsed_at`, never the clock). Until M4,
+the Overview page's Events / min card is the only live silence visibility.
 
 ## Deferred, with numbers
 

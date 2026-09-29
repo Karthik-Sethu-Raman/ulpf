@@ -137,6 +137,7 @@ function FieldHealthRow({
               className="unquarantine"
               disabled={busy}
               onClick={unquarantine}
+              title="Drift may re-quarantine this field while the offending window remains in view"
             >
               Un-quarantine
             </button>

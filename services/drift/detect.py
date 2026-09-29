@@ -289,7 +289,7 @@ def _window_scale(baseline_shape: dict, hist: dict) -> dict:
     window's observed-value count. R-M3-5's js_divergence add-1 smoothing is
     calibrated for COUNT-scale histograms (T3 pins 'grows toward ln2 as counts
     grow'); feeding raw proportions would let the +1s dominate the baseline
-    side and cap every shape comparison at ~0.32, leaving the severe band
+    side and cap every shape comparison at ~0.057, leaving the severe band
     unreachable. Rescaling puts both sides at the same count scale, where the
     smoothing is negligible and the ladder bands mean what T3 calibrated."""
     total = sum(hist.values())
