@@ -18,7 +18,7 @@ from datetime import datetime
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from gateway import queries, writes
@@ -39,6 +39,14 @@ def _json_default(value):
     if isinstance(value, datetime):
         return value.isoformat()
     raise TypeError(f"unserializable SSE value: {type(value).__name__}")
+
+
+def _wire_str(value) -> str:
+    """Scalar wire form shared by BOTH exports: exactly the serialization
+    _json_default applies inside json.dumps (UUID -> str, datetime ->
+    ISO-8601), applied to Parquet columns BEFORE the arrow table is built so
+    every non-int column is a plain string and the file schema stays stable."""
+    return value.isoformat() if isinstance(value, datetime) else str(value)
 
 
 async def sse_events(queries_module, poll_seconds, heartbeat_seconds, max_polls):
@@ -97,6 +105,61 @@ class ManualBody(BaseModel):
     mappings: list[MappingBody]
     actor: str = "anonymous"
     confidence: float | None = None
+
+
+class UnquarantineBody(BaseModel):
+    field: str
+    actor: str = "anonymous"
+    reason: str | None = None
+
+
+# --- M3 export bodies (Task 8; spec §11 / PS g+h — SIEM/data-lake feeds). ------
+# Both builders are module-level like sse_events so the routes can run them in
+# a worker thread; both share fetch_export_rows (parsed-only current view,
+# newest first, EXPORT_MAX-capped) so the two formats carry identical rows.
+
+def _export_jsonl_lines(queries_module, fingerprint, status, limit) -> list[str]:
+    """OCSF JSONL export body, assembled in the caller's worker thread (the
+    route runs this via asyncio.to_thread so the fetch + serialization never
+    touch the event loop): ONE OCSF document per line, newest first. Rows
+    arrive parsed-only from fetch_export_rows, so no line is ever "null".
+    Memory bound = the EXPORT_MAX cap: the row list and the line list are both
+    capped by the same LIMIT."""
+    rows = queries_module.fetch_export_rows(fingerprint, status, limit)
+    return [json.dumps(row["ocsf"], default=_json_default) for row in rows]
+
+
+def _export_parquet_bytes(queries_module, fingerprint, limit) -> bytes:
+    """Parquet export body, built in the caller's worker thread. pyarrow is
+    imported lazily (mirrors queries.py's lazy psycopg) so importing
+    gateway.app stays cheap for non-export callers. The ocsf column is stored
+    as a JSON-serialized STRING per row: nested OCSF documents vary row to row
+    (optional attributes come and go), so a struct schema would churn with
+    every producer change — a flat string column keeps the file schema
+    constant for data-lake ingestion (consumers json-parse it on read).
+    Timestamps/UUIDs are wire-serialized BEFORE the table (_wire_str: the same
+    serialization as the JSONL export) so both formats carry identical values
+    and the arrow types are plain strings. Memory bound = the EXPORT_MAX cap
+    (row list + column arrays + the in-memory file)."""
+    import io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rows = queries_module.fetch_export_rows(fingerprint, None, limit)
+    table = pa.table({
+        "event_id": pa.array([_wire_str(r["event_id"]) for r in rows], type=pa.string()),
+        "raw_id": pa.array([_wire_str(r["raw_id"]) for r in rows], type=pa.string()),
+        "fingerprint_id": pa.array([r["fingerprint_id"] for r in rows], type=pa.string()),
+        "rule_version": pa.array([r["rule_version"] for r in rows], type=pa.int32()),
+        "status": pa.array([r["status"] for r in rows], type=pa.string()),
+        "parsed_at": pa.array([_wire_str(r["parsed_at"]) for r in rows], type=pa.string()),
+        "ocsf": pa.array([json.dumps(r["ocsf"], default=_json_default) for r in rows],
+                         type=pa.string()),
+    })
+    sink = io.BytesIO()
+    pq.write_table(table, sink, compression="snappy")
+    return sink.getvalue()
 
 
 def _write_http_error(exc: writes.WriteError) -> HTTPException:
@@ -236,6 +299,68 @@ def build_app(queries_module=queries, writes_module=writes,
                 actor=body.actor, reason=body.reason)
         except writes.WriteError as exc:
             raise _write_http_error(exc) from exc
+
+    # ---------- M3: drift surfaces + human un-quarantine (Task 7) ----------
+
+    @app.get("/api/drift/metrics")
+    async def drift_metrics():
+        return {"metrics": await asyncio.to_thread(queries_module.fetch_drift_metrics)}
+
+    @app.get("/api/drift/alerts")
+    async def drift_alerts():
+        # P-4: one kind-discriminated list — "window" rows (drift_windows with
+        # minor/moderate/severe severity) merged with "audit" rows (quarantine/
+        # un-quarantine/deactivate actions, any actor), latest first.
+        return {"alerts": await asyncio.to_thread(queries_module.fetch_drift_alerts)}
+
+    @app.post("/api/rules/{fingerprint_id}/unquarantine")
+    async def unquarantine(fingerprint_id: str, body: UnquarantineBody):
+        try:
+            return await asyncio.to_thread(
+                writes_module.unquarantine_field, fingerprint_id, body.field,
+                actor=body.actor, reason=body.reason)
+        except writes.WriteError as exc:
+            raise _write_http_error(exc) from exc
+
+    # ---------- M3: export endpoints (Task 8; spec §11 / PS g+h) ----------
+
+    @app.get("/api/export/ocsf")
+    async def export_ocsf(
+        fingerprint: str | None = None,
+        status: str | None = None,
+        limit: int = Query(default=queries.EXPORT_MAX),
+    ):
+        """OCSF JSONL export: application/x-ndjson, ONE OCSF document per
+        line, newest first. Parsed-status DEFAULT — the export carries OCSF
+        documents and only parsed rows have one, so the status filter narrows
+        WITHIN parsed: non-parsed rows are SKIPPED (status=unparsed/
+        parse_error/quarantined matches nothing and yields a 200 with an empty
+        stream — never a "null" line). limit deliberately has NO le= bound:
+        a bulk export must not 422; the fetch clamps it to EXPORT_MAX."""
+        lines = await asyncio.to_thread(
+            _export_jsonl_lines, queries_module, fingerprint, status, limit)
+        return StreamingResponse((line + "\n" for line in lines),
+                                 media_type="application/x-ndjson")
+
+    @app.get("/api/export/parquet")
+    async def export_parquet(
+        fingerprint: str | None = None,
+        limit: int = Query(default=queries.EXPORT_MAX),
+    ):
+        """Parquet export: the SAME fetch as the JSONL endpoint (EventRow
+        columns + ocsf, parsed-only current view, newest first, EXPORT_MAX-
+        capped; no status param in the frozen signature — the parsed default
+        applies), returned as a snappy-compressed attachment. The ocsf column
+        rides as a JSON string (flat, stable schema) and timestamps are
+        ISO-8601 strings — see _export_parquet_bytes."""
+        data = await asyncio.to_thread(
+            _export_parquet_bytes, queries_module, fingerprint, limit)
+        return Response(
+            content=data,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition":
+                     'attachment; filename="ulpf-events.parquet"'},
+        )
 
     return app
 

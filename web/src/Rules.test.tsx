@@ -33,6 +33,7 @@ function ruleRow(overrides: Partial<RuleRow> = {}): RuleRow {
     provenance: 'slm',
     confidence: 0.87,
     status: 'active',
+    quarantined_fields: [], // P-8 additive key — empty on this fixture
     created_by: 'onboarding',
     created_at: '2026-09-18T09:00:00Z',
     activated_at: '2026-09-19T10:00:00Z',

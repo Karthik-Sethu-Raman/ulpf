@@ -5,9 +5,14 @@
 // validation failures) so the Review Queue can render the gate's verdict.
 //
 // The Overview page is fed by the SSE stream; getRules/getSamples serve the
-// M2 review surfaces (Tasks 8/9), mirroring the gateway endpoint shapes.
+// M2 review surfaces (Tasks 8/9) and getDriftMetrics/getDriftAlerts the M3
+// Drift & Health page (Task 10), mirroring the gateway endpoint shapes. The
+// un-quarantine POST rides the exported postJson directly (Rules-deactivate
+// style) rather than a dedicated wrapper.
 import type {
   AuditResponse,
+  DriftAlertsResponse,
+  DriftMetricsResponse,
   EventsResponse,
   RawTrace,
   RuleHistoryResponse,
@@ -127,4 +132,19 @@ export function getSamples(
   return getJson<SamplesStatus | SamplesListResponse>(
     `/api/onboarding/samples${qs}`,
   )
+}
+
+// --- M3 drift surfaces (Task 7 endpoints; consumed by Task 10) ---------------
+
+/** GET /api/drift/metrics — the latest closed window per (fingerprint_id,
+ * field); the page's Field-health table renders rows verbatim. */
+export function getDriftMetrics(): Promise<DriftMetricsResponse> {
+  return getJson<DriftMetricsResponse>('/api/drift/metrics')
+}
+
+/** GET /api/drift/alerts — ONE latest-first merged list (window rows ∪ audit
+ * rows, discriminated by `kind`) that the page renders verbatim without
+ * re-merging or re-sorting (ruling P-4). */
+export function getDriftAlerts(): Promise<DriftAlertsResponse> {
+  return getJson<DriftAlertsResponse>('/api/drift/alerts')
 }

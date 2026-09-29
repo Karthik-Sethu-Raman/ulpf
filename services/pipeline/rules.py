@@ -3,11 +3,14 @@
 # One SELECT per batch (the worker refreshes every consume batch, so a rule
 # activated mid-stream is picked up on the next batch — no restart, no push).
 # mappings arrives as JSONB (list of {source_field, ocsf_path} dicts) and is
-# rebuilt into the typed Mapping model before parse() ever sees the rule.
+# rebuilt into the typed Mapping model before parse() ever sees the rule;
+# quarantined_fields arrives as TEXT[] (a Python list via psycopg) — the M3
+# drift role appends OCSF paths there and the worker filters those mappings.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from pydantic import Field
 from ulpf_core.models import Mapping, Rule
 
 if TYPE_CHECKING:
@@ -20,10 +23,13 @@ class ActiveRule(Rule):
     load_active_rules must return dict[str, Rule] per the plan contract, but
     normalized_events.rule_id wants the DB id — so the id rides on this Rule
     subclass (an ActiveRule IS a Rule; parse() and the type contract are
-    unaffected, and the worker reads ``rule.id`` for attribution).
+    unaffected, and the worker reads ``rule.id`` for attribution). M3 adds
+    the quarantine list the same way: model_copy in the worker's filter
+    preserves this class, so id and version ride along on filtered rules.
     """
 
     id: int
+    quarantined_fields: list[str] = Field(default_factory=list)
 
 
 def load_active_rules(conn: psycopg.Connection) -> dict[str, Rule]:
@@ -32,16 +38,19 @@ def load_active_rules(conn: psycopg.Connection) -> dict[str, Rule]:
     rules: dict[str, Rule] = {}
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, fingerprint_id, version, pattern, mappings, provenance "
+            "SELECT id, fingerprint_id, version, pattern, mappings, "
+            "quarantined_fields, provenance "
             "FROM rules WHERE status = 'active'"
         )
-        for rule_id, fingerprint, version, pattern, mappings, provenance in cur.fetchall():
+        for (rule_id, fingerprint, version, pattern, mappings, quarantined,
+             provenance) in cur.fetchall():
             rules[fingerprint] = ActiveRule(
                 id=rule_id,
                 fingerprint_id=fingerprint,
                 version=version,
                 pattern=pattern,
                 mappings=[Mapping(**m) for m in mappings],
+                quarantined_fields=list(quarantined or []),
                 provenance=provenance,
             )
     return rules

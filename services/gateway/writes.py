@@ -482,3 +482,59 @@ def _reactivate_once(conn, rule_id, actor, reason):
             "reason": reason,
         }, actor=actor)
         return {"rule_id": rule_id, "version": row["version"], "status": "active"}
+
+
+# --- un-quarantine (M3 Task 7: human override of drift's field quarantine) ------
+
+# Column-scoped exactly to migration 007's rules_role grant (quarantined_fields
+# only). The predicate carries BOTH TOCTOU backstops: status='active' and the
+# field actually being quarantined — so an inactive rule, a concurrent
+# un-quarantine, or a never-quarantined field updates zero rows and can never
+# still write the audit row. RETURNING supplies the post-state list for the
+# response body plus the rule identity for the audit detail.
+_UNQUARANTINE_SQL = (
+    "UPDATE rules SET quarantined_fields = array_remove(quarantined_fields, %s) "
+    "WHERE fingerprint_id = %s AND status = 'active' "
+    "AND (%s = ANY(quarantined_fields)) "
+    "RETURNING quarantined_fields, id, version"
+)
+
+
+def unquarantine_field(fingerprint_id: str, field: str, *, actor: str = "anonymous",
+                       reason: str | None = None,
+                       conn: psycopg.Connection | None = None) -> dict:
+    """Remove one field from the ACTIVE rule's quarantined_fields — the human
+    override that re-enables a mapping drift quarantined (values were preserved
+    in unmapped, so nothing is lost). 404 when the fingerprint has no rule row
+    at all; 409 when the UPDATE matches nothing: the rule is inactive, or the
+    field is not quarantined (anymore). The field_unquarantined audit row is
+    paired INSIDE the same transaction as the mutation."""
+    return _run(_unquarantine_once, conn, fingerprint_id, field, actor, reason)
+
+
+def _unquarantine_once(conn, fingerprint_id, field, actor, reason):
+    with conn.transaction(), conn.cursor() as cur:
+        # Existence pre-check first (the deactivate_rule pattern) so an unknown
+        # fingerprint answers 404, distinct from the UPDATE's 409 cases. Any
+        # rule row proves the fingerprint known — status is deliberately NOT
+        # filtered here (inactive is a 409, not a 404).
+        cur.execute(
+            "SELECT id FROM rules WHERE fingerprint_id = %s LIMIT 1",
+            (fingerprint_id,),
+        )
+        if cur.fetchone() is None:
+            raise NotFoundError(f"no rule for fingerprint {fingerprint_id!r}")
+        cur.execute(_UNQUARANTINE_SQL, (field, fingerprint_id, field))
+        if cur.rowcount == 0:
+            raise ConflictError(
+                f"field {field!r} is not quarantined on the active rule for "
+                f"fingerprint {fingerprint_id!r} (or the rule is not active)")
+        row = cur.fetchone()
+        _audit(cur, "field_unquarantined", fingerprint_id, {
+            "field": field,
+            "rule_id": row["id"],
+            "version": row["version"],
+            "reason": reason,
+        }, actor=actor)
+        return {"fingerprint_id": fingerprint_id, "field": field,
+                "quarantined_fields": row["quarantined_fields"]}

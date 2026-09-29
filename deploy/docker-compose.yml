@@ -48,6 +48,11 @@ services:
     environment:
       KAFKA_BOOTSTRAP: redpanda:9092
       DATABASE_URL: postgresql://pipeline_role:pipeline_dev@postgres:5432/ulpf
+      # Sample-capture headroom (M3 Task 12): the accumulating multi-run DB
+      # saturates the 200/fingerprint cap — after which a drift-deactivated
+      # fingerprint cannot accumulate onboarding samples and its re-entry is
+      # unobservable. Default stays 200; the smoke exports a larger value.
+      ULPF_SAMPLE_CAPTURE_CAP: ${ULPF_SAMPLE_CAPTURE_CAP:-200}
     restart: unless-stopped
     depends_on: { migrate: { condition: service_completed_successfully }, topics: { condition: service_completed_successfully }, seed: { condition: service_completed_successfully } }
   gateway:
@@ -80,6 +85,21 @@ services:
       DATABASE_URL: postgresql://onboarding_role:onboarding_dev@postgres:5432/ulpf
       OLLAMA_URL: ${ULPF_OLLAMA_URL:-http://ollama-4b:11434}
       OLLAMA_MODEL: ${ULPF_OLLAMA_MODEL:-qwen3:4b}
+    restart: unless-stopped
+    depends_on: { migrate: { condition: service_completed_successfully } }
+  # M3 drift detection (cold path, Postgres only — no Kafka, no profile so it
+  # is always on): statelessly recomputes per-fingerprint windows from the DB
+  # current view, fires tier-1 invariants from event zero, tier-2 statistics
+  # once a baseline exists; INSERT-only drift writes. Fail-closed: a failed
+  # scan is retried next poll — drift never blocks the hot path.
+  drift:
+    build: { context: .., dockerfile: services/drift/Dockerfile }
+    environment:
+      DATABASE_URL: postgresql://drift_role:drift_dev@postgres:5432/ulpf
+      ULPF_DRIFT_WINDOW_COUNT: ${ULPF_DRIFT_WINDOW_COUNT:-1000}
+      ULPF_DRIFT_WINDOW_TIME_S: ${ULPF_DRIFT_WINDOW_TIME_S:-600}
+      ULPF_DRIFT_BASELINE_WINDOWS: ${ULPF_DRIFT_BASELINE_WINDOWS:-10}
+      ULPF_DRIFT_POLL_S: ${ULPF_DRIFT_POLL_S:-5}
     restart: unless-stopped
     depends_on: { migrate: { condition: service_completed_successfully } }
   # Ollama sidecars. No host port by design: only the onboarding service talks

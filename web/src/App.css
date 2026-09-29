@@ -587,3 +587,132 @@ body {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* --- events browser (M3 Task 9) --------------------------------------------
+   The table reuses .feed-table (borders, sticky header, row hover) and the
+   badge-* tokens; the additions below only cover the filter bar, which no
+   existing class expresses. */
+
+.filters {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.filters select,
+.filters input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 13px;
+}
+
+.filters select:focus-visible,
+.filters input:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.filters button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.filters button:hover {
+  border-color: var(--accent);
+}
+
+/* --- drift & health (M3 Task 10) --------------------------------------------
+   The field-health table reuses .feed-table and the badge-* tokens; the feed
+   reuses .audit-feed / .audit-sep; the opportunity cards reuse .cards / .card.
+   The additions below only cover what no existing class expresses: severity
+   badge colors, non-pointer rows, the un-quarantine button, the section
+   headers, the merged-feed items and the opportunity card copy. */
+
+/* severity ladder: none is quiet, minor warns, moderate is the quarantine
+   band (echoing badge-quarantined's purple), severe is the deactivate band */
+.badge-none     { color: var(--muted); }
+.badge-minor    { color: var(--warn); }
+.badge-moderate { color: var(--quar); }
+.badge-severe   { color: var(--err); }
+
+/* section headers inside the page (Field health / Enforcement feed /
+   Extension opportunities) */
+.drift-section h2 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 22px 0 8px;
+}
+
+/* drift rows are read-only — no row pointer/hover-click affordance */
+.drift-table tbody tr {
+  cursor: default;
+}
+
+/* the human override button on currently-quarantined field rows */
+.drift-table .unquarantine {
+  background: rgba(163, 113, 247, 0.14);
+  border: 1px solid var(--quar);
+  border-radius: 6px;
+  color: var(--quar);
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  margin-left: 8px;
+}
+
+.drift-table .unquarantine:hover {
+  border-color: var(--text);
+}
+
+.drift-table .unquarantine:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* the per-row un-quarantine error banner spans the whole table row */
+.drift-error-row td {
+  cursor: default;
+  background: var(--panel-2);
+}
+
+/* one merged latest-first feed: window alerts and audit actions alike */
+.drift-feed-item {
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+
+/* opportunity cards: the "new telemetry key observed" copy stays lowercase
+   (it reads as a finding, not a header) */
+.opportunity h3 {
+  margin: 0 0 6px;
+  font-size: 14px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+}
+
+.opportunity p {
+  margin: 4px 0;
+  font-size: 13px;
+}

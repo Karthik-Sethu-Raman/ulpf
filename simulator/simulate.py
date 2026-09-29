@@ -20,6 +20,16 @@
 # is idle — no send, no cursor advance — so the already-running corpora are
 # untouched while it waits.
 #
+# Modes (T11): "firmware-drift" keeps the steady corpus set but degrades it on
+# the wire: after --drift-after seconds, every syslog line handed to the sender
+# passes through corrupt_syslog() with a phase that escalates from 0 to 1 over
+# the remaining run budget (R-P3). Corrupted lines split exactly 1:2 (R-P9):
+# SRC is renamed to SRCADDR (the collector's SRC parse reads null — null-rate
+# spike) or its value becomes the invalid SRC=uplink-trust-0x4f (tier-1
+# violation) — the drift-engine demo's live-rule degradation on real traffic.
+# Only line CONTENT mutates: per-corpus counts, the other corpora, and the
+# stdout contract below are unchanged.
+#
 # Stdout contract (parsed by the M1 smoke test): exactly one line per corpus,
 #   <name> sent=<N>
 # then a final "total sent=<N>". Everything else goes to stderr. Exit 0 unless
@@ -31,6 +41,7 @@ import argparse
 import asyncio
 import inspect
 import os
+import re
 import socket
 import sys
 import time
@@ -50,6 +61,14 @@ UDP_KEYS = frozenset({"cef", "syslog", "acmegw", "newapp"})
 HTTP_KEYS = frozenset({"json"})
 CORPUS_KEYS = sorted(UDP_KEYS | HTTP_KEYS)
 NEWAPP_KEY = "newapp"  # loaded only in --mode new-appliance (see load_corpora)
+SYSLOG_KEY = "syslog"  # the only corpus --mode firmware-drift mutates (T11)
+
+# firmware-drift corruption profile (T11; controller rulings R-P3 / R-P9).
+DRIFT_HASH_MULT = 2654435761  # Knuth multiplicative hash: the seed IS the line index
+DRIFT_HASH_MOD = 1000
+ESCALATION_SPAN_FLOOR_S = 1.0  # escalation window floor: never divide by zero
+_SRC_FIELD_RE = re.compile(r"\bSRC=")
+_SRC_VALUE_RE = re.compile(r"\bSRC=\S*")
 
 
 def transport_for(key: str) -> str:
@@ -200,12 +219,58 @@ def default_senders() -> dict:
     return senders
 
 
+def escalation_span(duration: float, drift_after: float) -> float:
+    """Seconds over which corruption ramps to 100% once drift starts (R-P3).
+
+    Defaults to the remaining run budget (duration - drift_after), floored at
+    ESCALATION_SPAN_FLOOR_S so a drift that starts at (or after) the deadline
+    still escalates over a sane window instead of dividing by zero.
+    """
+    return max(duration - drift_after, ESCALATION_SPAN_FLOOR_S)
+
+
+def drift_phase(elapsed_since_drift: float, span: float) -> float:
+    """Corruption fraction in [0, 1]; monotonic non-decreasing in elapsed (R-P3)."""
+    return min(max(elapsed_since_drift / span, 0.0), 1.0)
+
+
+def corrupt_syslog(line: str, index: int, phase: float) -> str:
+    """Mutate one syslog line per the firmware-drift profile (T11, R-P3/R-P9).
+
+    R-P3 selection (seed = line index; no RNG state anywhere): the line is
+    corrupted iff (index * 2654435761 % 1000) / 1000 < phase — strictly, so
+    phase 0 corrupts nothing and phase 1 corrupts everything (2654435761 % 1000
+    = 761 is coprime with 1000, making the selector a permutation of [0, 1):
+    phase p hits exactly p of any 1000 consecutive indices). R-P9 then splits
+    the corrupted lines exactly 1:2 by index mod 3: index % 3 == 0 renames the
+    field SRC -> SRCADDR, value kept (the collector's SRC parse reads null —
+    the null-rate spike); every other corrupted line gets its SRC value
+    replaced with the invalid token uplink-trust-0x4f (tier-1 violation). A
+    line with no SRC= field passes through unchanged.
+    """
+    selector = (index * DRIFT_HASH_MULT % DRIFT_HASH_MOD) / DRIFT_HASH_MOD
+    if selector >= phase:  # R-P3: strict <; a selector equal to phase is NOT hit
+        return line
+    if "SRC=" not in line:
+        return line  # nothing to mutate; the line passes through byte-identical
+    if index % 3 == 0:
+        return _SRC_FIELD_RE.sub("SRCADDR=", line, count=1)
+    return _SRC_VALUE_RE.sub("SRC=uplink-trust-0x4f", line, count=1)
+
+
 async def run(corpora: list[Corpus], *, eps: float, duration: float,
-              loop: bool = False) -> tuple[dict, int]:
+              loop: bool = False, drift_after: float | None = None) -> tuple[dict, int]:
     """Send the corpora round-robin at eps total events/sec.
 
     A corpus with start_at > 0 stays idle (no send, no cursor advance) until
     that many seconds have elapsed, then joins the rotation in place.
+
+    drift_after (firmware-drift mode, T11): once that many seconds have
+    elapsed, syslog lines pass through corrupt_syslog() with a phase that
+    escalates from 0 to 1 over escalation_span(duration, drift_after); the
+    decision is made per send (send-start time), so a pass that straddles the
+    boundary sends clean lines before it and mutated lines after it. None
+    (steady / new-appliance) never mutates a line.
 
     Returns (sent_per_corpus, error_count). A send counts only when the
     transport accepted it (UDP sendto returned; HTTP got a 202).
@@ -220,6 +285,9 @@ async def run(corpora: list[Corpus], *, eps: float, duration: float,
     start = time.monotonic()
     deadline = start + max(duration, 0.0)
     cursors = [0] * n
+    if drift_after is not None:
+        drift_after = max(drift_after, 0.0)
+        span = escalation_span(duration, drift_after)
 
     pass_no = 0
     while True:
@@ -239,7 +307,13 @@ async def run(corpora: list[Corpus], *, eps: float, duration: float,
                     continue
                 cursors[i] = 0
             line = corpus.lines[cursors[i]]
+            index = cursors[i]  # the corpus line index is the R-P3 seed
             cursors[i] += 1
+            if drift_after is not None and corpus.name == SYSLOG_KEY:
+                elapsed = time.monotonic() - start
+                if elapsed >= drift_after:  # boundary respected mid-pass, per send
+                    line = corrupt_syslog(line, index,
+                                          drift_phase(elapsed - drift_after, span))
             try:
                 sent[corpus.name] += await corpus.sender.send(line)
             except Exception as exc:  # noqa: BLE001 - one failed send counts and moves on
@@ -282,12 +356,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
                    help="directory holding raw_logs_*.txt (default: simulator/data)")
     p.add_argument("--loop", action="store_true",
                    help="repeat the corpora until --duration elapses")
-    p.add_argument("--mode", choices=("steady", "new-appliance"), default="steady",
+    p.add_argument("--mode", choices=("steady", "new-appliance", "firmware-drift"),
+                   default="steady",
                    help="steady: golden corpora only (default); new-appliance: "
-                        "also replay the unknown-format newapp corpus (T10)")
+                        "also replay the unknown-format newapp corpus (T10); "
+                        "firmware-drift: syslog lines mutate after --drift-after, "
+                        "escalating to 100% by the end of the run (T11)")
     p.add_argument("--new-after", type=float, default=0.0, dest="new_after",
                    help="new-appliance only: seconds before the newapp corpus "
                         "joins the rotation (default 0; steady ignores this)")
+    p.add_argument("--drift-after", type=float, default=5.0, dest="drift_after",
+                   help="firmware-drift only: seconds before syslog lines start "
+                        "mutating (corruption then escalates over the remaining "
+                        "run budget) (default 5; other modes ignore this)")
     return p.parse_args(argv)
 
 
@@ -313,10 +394,12 @@ def main(argv: list[str] | None = None) -> int:
     for corpus in corpora:
         if corpus.name == NEWAPP_KEY:
             corpus.start_at = max(args.new_after, 0.0)
+    drift_after = max(args.drift_after, 0.0) if args.mode == "firmware-drift" else None
 
     async def drive():
         try:
-            return await run(corpora, eps=args.eps, duration=args.duration, loop=args.loop)
+            return await run(corpora, eps=args.eps, duration=args.duration,
+                             loop=args.loop, drift_after=drift_after)
         finally:
             await _close_all(senders)
 
